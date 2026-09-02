@@ -140,3 +140,7 @@ AUR packages are user-produced build recipes. pacmkr avoids evaluating a
 PKGBUILD merely to read its metadata, but building a package necessarily runs
 its build functions. Inspect unfamiliar PKGBUILDs and their sources before
 continuing.
+
+## License
+
+pacmkr is available under the [MIT License](LICENSE).
