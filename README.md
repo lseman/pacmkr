@@ -26,7 +26,6 @@ to pacman, and AUR packages are resolved and built in dependency order.
 - PKGBUILD parsing, source verification, packaging, and installation
 - Optional LTO, mold, GCC Graphite, and LLVM Polly build optimization
 - Interactive terminal output with multi-package progress
-- Experimental Slint GUI sources
 
 ## Quick start
 
@@ -139,7 +138,6 @@ src/backend/     libalpm, pacman, repository, and AUR integration
 src/build/       PKGBUILD parsing and package build pipeline
 src/core/        Configuration, package models, shared infrastructure
 src/tui/         Argument parsing, status output, and progress UI
-src/gui/         Experimental Slint desktop UI
 tests/           C++ unit and regression tests
 ```
 
