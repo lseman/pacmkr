@@ -1,0 +1,429 @@
+import { StandardButtonRole, DialogLayout } from "slint";
+
+/// Package entry in the unified search results list
+export component SearchResultItem {
+    in-out property string name;
+    in-out property string version;
+    in-out property string origin: "aur" | "repo";  // aur or repo (core/extra/etc.)
+    in-out property string description;
+    in-out property bool is_out_of_date;
+
+    HorizontalLayout {
+        spacing: 12px;
+
+        // Origin badge (AUR vs Repo)
+        Rectangle {
+            width: 40px;
+            height: parent.height;
+            background: bind origin == "aur" ? rgb(255, 165, 0) : rgb(70, 130, 180);
+            border-radius: 6px;
+
+            Text {
+                text: bind origin == "aur" ? "AUR" : "R";
+                color: white;
+                font-weight: bold;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        // Package info (flex layout)
+        VerticalLayout {
+            spacing: 4px;
+            flex-grow: 1;
+
+            Row {
+                spacing: 8px;
+
+                Text {
+                    text: bind name;
+                    font-weight: bold;
+                    font-size: 14px;
+                    color: rgb(255, 255, 255);
+                }
+
+                Text {
+                    text: bind version;
+                    color: rgb(180, 180, 180);
+                    font-size: 12px;
+                }
+            }
+
+            Text {
+                text: bind description;
+                color: rgb(160, 160, 160);
+                font-size: 12px;
+                max-lines: 1;
+                elide: right;
+            }
+        }
+
+        // Out-of-date indicator
+        Rectangle {
+            width: 8px;
+            height: 8px;
+            visible: bind is_out_of_date;
+            background: rgb(255, 69, 0);
+            border-radius: 4px;
+        }
+    }
+}
+
+/// Main application window
+export component MainWindow {
+    in-out property string search_query;
+    in-out property bool searching;
+    in-out property bool build_in_progress;
+    in-out property string build_status;
+    in-out property int progress_value;
+    in-out property string log_output;
+
+    // Data model for results (populated by C++ backend)
+    list<SearchResultItem> search_results;
+
+    // Selected package for info panel
+    in-out property SearchResultItem selected_package;
+
+    // Build targets (packages to build/install)
+    list<SearchResultItem> build_targets;
+
+    // Main layout
+    VerticalLayout {
+        spacing: 0;
+
+        // ─── Header / Search Bar ─────────────────────────────────────
+        Rectangle {
+            height: 60px;
+            background: rgb(30, 30, 40);
+
+            HorizontalLayout {
+                spacing: 12px;
+                padding-left: 16px;
+                padding-right: 16px;
+
+                // Search input
+                TextInput {
+                    id: search_input
+                    text: bind search_query;
+                    placeholder-text: "Search packages (AUR + repositories)...";
+                    font-size: 14px;
+                    background: rgb(50, 50, 60);
+                    border-radius: 8px;
+                    padding: 8px;
+                    flex-grow: 1;
+
+                    on-return-pressed: {
+                        root.trigger_search();
+                    }
+                }
+
+                // Search button
+                Button {
+                    text: searching ? "⏳" : "🔍";
+                    enabled: !searching;
+                    background: rgb(70, 130, 180);
+                    border-radius: 8px;
+                    padding: 8px 16px;
+
+                    on-clicked: {
+                        root.trigger_search();
+                    }
+                }
+
+                // Refresh cache button
+                Button {
+                    text: "↻";
+                    tooltip: "Refresh AUR cache";
+                    background: rgb(60, 60, 70);
+                    border-radius: 8px;
+                    padding: 8px 12px;
+
+                    on-clicked: {
+                        root.refresh_cache();
+                    }
+                }
+            }
+        }
+
+        // ─── Main Content Area ──────────────────────────────────────
+        RowLayout {
+            spacing: 0;
+            flex-grow: 1;
+
+            // ─── Left Panel: Search Results ──────────────────────────
+            VerticalLayout {
+                id: results_panel
+                flex-grow: 1;
+                padding: 8px;
+                spacing: 4px;
+
+                // Results header
+                Row {
+                    spacing: 8px;
+                    padding-bottom: 8px;
+
+                    Text {
+                        text: "Results";
+                        font-weight: bold;
+                        color: rgb(255, 255, 255);
+                        font-size: 14px;
+                    }
+
+                    Text {
+                        text: bind search_results.length + " packages found";
+                        color: rgb(160, 160, 160);
+                        font-size: 12px;
+                    }
+                }
+
+                // Scrollable results list
+                Rectangle {
+                    Layout.preferred-height: 300px;
+                    background: rgb(40, 40, 50);
+                    border-radius: 8px;
+
+                    VerticalLayout {
+                        spacing: 2px;
+                        padding: 4px;
+
+                        // Results list (virtualized)
+                        ListView {
+                            id: results_list
+                            model: root.search_results;
+                            delegate: SearchResultItem {
+                                width: results_list.width - 8;
+
+                                on-clicked: {
+                                    root.select_package(item);
+                                }
+
+                                on-double-clicked: {
+                                    root.add_to_build_queue(item);
+                                }
+                            }
+                        }
+
+                        // Empty state
+                        Text {
+                            visible: bind search_results.length == 0 && !searching;
+                            text: "Enter a search term to find packages";
+                            color: rgb(120, 120, 140);
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            font-size: 13px;
+                        }
+                    }
+                }
+
+                // Build queue section (shown when packages selected)
+                Rectangle {
+                    visible: bind build_targets.length > 0;
+                    height: 120px;
+                    background: rgb(45, 45, 55);
+                    border-radius: 8px;
+                    margin-top: 8px;
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        padding: 8px;
+
+                        Row {
+                            spacing: 8px;
+
+                            Text {
+                                text: "Build Queue (" + build_targets.length + ")";
+                                font-weight: bold;
+                                color: rgb(255, 255, 255);
+                                font-size: 13px;
+                            }
+                        }
+
+                        // Build targets list
+                        ListView {
+                            Layout.preferred-height: 60px;
+                            model: root.build_targets;
+                            delegate: SearchResultItem {
+                                width: results_list.width - 8;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ─── Right Panel: Package Info & Build ───────────────────
+            Rectangle {
+                id: info_panel
+                Layout.preferred-width: 320px;
+                background: rgb(35, 35, 45);
+
+                VerticalLayout {
+                    spacing: 0;
+
+                    // Package info section
+                    Rectangle {
+                        height: 280px;
+                        padding: 12px;
+
+                        Text {
+                            text: "Package Details";
+                            font-weight: bold;
+                            color: rgb(255, 255, 255);
+                            font-size: 14px;
+                            margin-bottom: 8px;
+                        }
+
+                        // Selected package info
+                        Text {
+                            visible: bind selected_package.name != "";
+                            text: bind selected_package.name + " " + selected_package.version;
+                            color: rgb(200, 200, 200);
+                            font-size: 13px;
+                            margin-bottom: 4px;
+                        }
+
+                        Text {
+                            visible: bind selected_package.name != "";
+                            text: bind selected_package.description;
+                            color: rgb(160, 160, 160);
+                            font-size: 12px;
+                            max-lines: 3;
+                            elide: right;
+                        }
+
+                        // Info about AUR packages
+                        Text {
+                            visible: bind selected_package.origin == "aur";
+                            text: "Votes: -- | Out of date: --";
+                            color: rgb(140, 140, 160);
+                            font-size: 11px;
+                            margin-top: 8px;
+                        }
+
+                        // Action buttons
+                        Row {
+                            spacing: 8px;
+                            margin-top: 12px;
+
+                            Button {
+                                text: "Install";
+                                enabled: bind selected_package.name != "";
+                                background: rgb(70, 130, 180);
+                                border-radius: 6px;
+                                padding: 6px 12px;
+
+                                on-clicked: {
+                                    root.add_to_build_queue(selected_package);
+                                }
+                            }
+
+                            Button {
+                                text: "View Details";
+                                enabled: bind selected_package.name != "";
+                                background: rgb(60, 60, 70);
+                                border-radius: 6px;
+                                padding: 6px 12px;
+
+                                on-clicked: {
+                                    root.view_details(selected_package);
+                                }
+                            }
+                        }
+                    }
+
+                    // Build progress section
+                    Rectangle {
+                        height: 200px;
+                        padding: 12px;
+
+                        Text {
+                            text: "Build Status";
+                            font-weight: bold;
+                            color: rgb(255, 255, 255);
+                            font-size: 14px;
+                            margin-bottom: 8px;
+                        }
+
+                        // Progress bar
+                        Rectangle {
+                            visible: bind build_in_progress;
+                            height: 6px;
+                            background: rgb(60, 60, 70);
+                            border-radius: 3px;
+                            margin-bottom: 8px;
+
+                            Rectangle {
+                                width: bind progress_value * parent.width / 100;
+                                height: 6px;
+                                background: rgb(70, 130, 180);
+                                border-radius: 3px;
+                            }
+                        }
+
+                        // Build status text
+                        Text {
+                            visible: bind build_in_progress || build_status != "";
+                            text: bind build_status;
+                            color: rgb(200, 200, 200);
+                            font-size: 12px;
+                            margin-bottom: 8px;
+                        }
+
+                        // Build button
+                        Button {
+                            visible: bind !build_in_progress && build_targets.length > 0;
+                            text: "Build & Install";
+                            enabled: true;
+                            background: rgb(70, 160, 70);
+                            border-radius: 6px;
+                            padding: 8px 16px;
+
+                            on-clicked: {
+                                root.start_build();
+                            }
+                        }
+
+                        // Cancel button
+                        Button {
+                            visible: bind build_in_progress;
+                            text: "Cancel";
+                            background: rgb(200, 70, 70);
+                            border-radius: 6px;
+                            padding: 8px 16px;
+
+                            on-clicked: {
+                                root.cancel_build();
+                            }
+                        }
+
+                        // Log output area
+                        Rectangle {
+                            visible: bind log_output != "";
+                            height: 100px;
+                            background: rgb(25, 25, 35);
+                            border-radius: 6px;
+                            margin-top: 8px;
+
+                            TextEdit {
+                                text: bind log_output;
+                                read-only: true;
+                                font-family: "monospace";
+                                font-size: 11px;
+                                color: rgb(180, 180, 200);
+                                wrap-mode: WordWrap;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ─── Callbacks (implemented in C++ backend) ──────────────────────
+    callback trigger_search();
+    callback refresh_cache();
+    callback select_package(item: SearchResultItem);
+    callback add_to_build_queue(item: SearchResultItem);
+    callback view_details(item: SearchResultItem);
+    callback start_build();
+    callback cancel_build();
+}

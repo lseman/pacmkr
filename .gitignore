@@ -1,0 +1,30 @@
+# CMake and test output
+/build/
+/build-*/
+/Testing/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/compile_commands.json
+
+# Rust output
+/target/
+
+# pacmkr runtime/build caches
+/.cache/
+/repos/
+/aur/
+*.pkg.tar.*
+*.src.tar.*
+
+# Local tooling and editor state
+/.agents/
+/.codex/
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# Local planning notes
+/FEATURE_GAP_ANALYSIS.md

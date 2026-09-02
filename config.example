@@ -1,0 +1,49 @@
+# pacmkr configuration file
+# Place at ~/.config/pacmkr/config
+#
+# Lines starting with # are comments.
+# Format: key = value
+
+# ─── AUR Settings ──────────────────────────────────────────────
+
+# Default directory to clone AUR repositories into
+aur_dir = ~/.cache/aur
+
+# ─── Build Defaults ────────────────────────────────────────────
+
+# Automatically sync dependencies before building (like -s)
+sync_deps = true
+
+# Automatically install after building (like -i)
+install = false
+
+# Clean build directories after building (like -C)
+clean_build = false
+
+# Clean up work files after build (like -c)
+clean = false
+
+# Skip checksum verification
+skip_checksums = false
+
+# ─── Optimization Defaults ─────────────────────────────────────
+
+# Enable link-time optimization by default
+lto = true
+
+# Use mold linker for faster linking (requires mold installed)
+mold = true
+
+# Enable Graphite loop optimizations (GCC only)
+graphite = false
+
+# Enable Polly optimizer (Clang only)
+polly = false
+
+# Override compiler (gcc or clang)
+# cc = clang
+
+# ─── Search Settings ──────────────────────────────────────────
+
+# Maximum number of results shown when searching AUR
+search_limit = 10
