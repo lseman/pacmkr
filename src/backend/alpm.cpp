@@ -1,12 +1,15 @@
 #include "pacmkr/alpm.h"
 #include "pacmkr/error.h"
+#include "pacmkr/pacman_config.h"
 
 #include <alpm.h>
 #include <alpm_list.h>
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <sstream>
+#include <utility>
 
 namespace pacmkr::alpm {
 
@@ -114,9 +117,15 @@ void init(const std::string& root, const std::string& db_path) {
     g_handle = alpm_initialize(root.c_str(), db_path.c_str(), nullptr);
     if (!g_handle) throw alpm_error("Failed to initialize libalpm");
     alpm_option_set_logcb(g_handle, log_callback, nullptr);
-    alpm_register_syncdb(g_handle, "core",  ALPM_DB_USAGE_ALL);
-    alpm_register_syncdb(g_handle, "extra", ALPM_DB_USAGE_ALL);
-    alpm_register_syncdb(g_handle, "multilib", ALPM_DB_USAGE_ALL);
+    std::ifstream pacman_conf(root == "/" ? "/etc/pacman.conf"
+                                            : root + "/etc/pacman.conf");
+    auto repositories = pacman_config::repository_names(pacman_conf);
+    if (repositories.empty()) {
+        repositories = {"core", "extra", "multilib"};
+    }
+    for (const auto& repository : repositories) {
+        alpm_register_syncdb(g_handle, repository.c_str(), ALPM_DB_USAGE_ALL);
+    }
 }
 
 void shutdown() {
@@ -136,6 +145,24 @@ std::vector<Package> get_local_packages() {
         auto* pkg = static_cast<alpm_pkg_t*>(it->data);
         if (pkg) result.push_back(pkg_from_alpm(pkg, "local"));
     }
+    return result;
+}
+
+std::vector<Package> get_foreign_packages() {
+    auto installed = get_local_packages();
+    std::vector<Package> result;
+    result.reserve(installed.size());
+
+    for (auto& pkg : installed) {
+        if (!get_sync_package(pkg.name)) {
+            result.push_back(std::move(pkg));
+        }
+    }
+
+    std::sort(result.begin(), result.end(),
+              [](const Package& lhs, const Package& rhs) {
+                  return lhs.name < rhs.name;
+              });
     return result;
 }
 

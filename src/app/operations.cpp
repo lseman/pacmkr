@@ -34,4 +34,26 @@ std::vector<std::string> repo_upgrade_args(bool refresh_databases,
     return args;
 }
 
+bool is_foreign_package_query(const std::vector<std::string>& args) {
+    for (const auto& arg : args) {
+        if (arg == "--list-foreign") return true;
+        if (arg.size() > 2 && arg[0] == '-' && arg[1] == 'Q' &&
+            arg.find('m', 2) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_quiet_query(const std::vector<std::string>& args) {
+    for (const auto& arg : args) {
+        if (arg == "--quiet") return true;
+        if (arg.size() > 2 && arg[0] == '-' && arg[1] == 'Q' &&
+            arg.find('q', 2) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace pacmkr::operations

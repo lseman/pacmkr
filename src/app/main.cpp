@@ -108,6 +108,7 @@ std::vector<std::string> extract_install_packages(const std::vector<std::string>
 
 /// Check if args represent a read-only query operation (handled by alpm).
 bool is_query_read(const std::vector<std::string>& args) {
+    if (operations::is_foreign_package_query(args)) return true;
     for (auto& arg : args) {
         if (arg == "--query" || arg == "-Q") continue;
         if (arg.size() >= 2 && arg[0] == '-' && arg[1] != '-') {
@@ -360,9 +361,10 @@ int run_query_read(const std::vector<std::string>& args) {
     bool do_info = false, do_list_files = false, do_mirrors = false,
          do_explicit = false, do_upgrades = false, do_search = false,
          do_dependents = false, do_tree = false, do_orphans = false,
-         do_quiet = false;
+         do_quiet = operations::is_quiet_query(args);
 
     for (auto& arg : args) {
+        if (arg == "--list-foreign") do_mirrors = true;
         if (arg.size() >= 2 && arg[0] == '-' && arg[1] != '-') {
             char primary = arg[1];
             if (primary == 'Q') {
@@ -521,17 +523,12 @@ int run_query_read(const std::vector<std::string>& args) {
         }
 
         if (do_mirrors) {
-            // -Qm: list explicitly installed packages not in repos (orphans/AUR)
-            auto local = alpm::get_local_packages();
-            for (auto& p : local) {
-                bool in_repo = false;
-                try {
-                    auto repo_pkg = alpm::get_sync_package(p.name);
-                    if (repo_pkg) in_repo = true;
-                } catch (...) {}
-                if (!in_repo && p.reason == alpm::Package::Reason::Explicit) {
-                    std::cout << p.name << " " << p.version << "\n";
-                }
+            // Foreign means absent from all sync databases. Installation
+            // reason is irrelevant: AUR dependencies are foreign too.
+            for (const auto& pkg : alpm::get_foreign_packages()) {
+                std::cout << pkg.name;
+                if (!do_quiet) std::cout << " " << pkg.version;
+                std::cout << "\n";
             }
         }
 

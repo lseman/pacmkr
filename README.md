@@ -64,6 +64,10 @@ pacmkr -Qm
 pacmkr -Rns package-name
 ```
 
+`pacmkr -Qm` (or `pacmkr --list-foreign`) lists every installed package
+that is absent from the configured repositories. This includes AUR packages
+and packages installed from custom/local PKGBUILDs. Use `-Qmq` for names only.
+
 Run `pacmkr --help` for the complete option reference.
 
 ### Build optimization

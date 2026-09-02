@@ -93,6 +93,10 @@ std::vector<Package> get_top_level_packages();
 /// Get packages installed explicitly by the user.
 std::vector<Package> get_explicit_packages();
 
+/// Get installed packages absent from every configured sync database.
+/// This includes AUR packages and packages installed from local PKGBUILDs.
+std::vector<Package> get_foreign_packages();
+
 /// Set a callback for libalpm log messages.
 void set_log_callback(std::function<void(int, const char*)> cb);
 

@@ -215,6 +215,9 @@ constexpr OptDef opts[] = {
     // Getpkgbuild
     {"--getpkgbuild", "-G", false},
 
+    // Installed AUR/local PKGBUILD packages
+    {"--list-foreign", nullptr, false},
+
     // Build flags
     {"--mflags", nullptr, true},
 
@@ -510,7 +513,10 @@ Cli parse(int argc, char* argv[]) {
                     std::string lf(def.long_flag + 2);
                     if (lf == "help")   { print_help(); exit(0); }
                     else if (lf == "version") { std::cout << "pacmkr 0.1.0\n"; exit(0); }
-                    else set_bool(cli, lf, true);
+                    else if (lf == "list-foreign") {
+                        cli.operation = Cli::Op::Query;
+                        cli.query_mirrors = true;
+                    } else set_bool(cli, lf, true);
                 }
                 consumed = true;
                 break;
@@ -545,6 +551,7 @@ void print_help() {
         "  -S, --sync        Sync/install packages (-Sy, -Su, -Ss, -Si, -Sl, etc.)\n"
         "  -T, --deptest     Test dependency resolution\n"
         "  -U, --upgrade     Upgrade from local file (-U package.pkg.tar.zst)\n"
+        "      --list-foreign List installed AUR/local PKGBUILD packages (-Qm)\n"
         "\n"
         "PKGBUILD Options (makepkg-compatible):\n"
         "  -p, --packagefile FILE    Use alternate build script\n"

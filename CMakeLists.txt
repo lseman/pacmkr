@@ -67,6 +67,7 @@ set(PACMKR_SOURCES
     src/core/config.cpp
     src/core/optimize.cpp
     src/core/package.cpp
+    src/core/pacman_config.cpp
     src/tui/cli.cpp
     src/tui/progress.cpp
     src/tui/status.cpp
@@ -100,6 +101,7 @@ if(PACMKR_BUILD_TESTS)
         tests/test_cli.cpp
         src/tui/cli.cpp
         src/app/operations.cpp
+        src/core/pacman_config.cpp
     )
     target_include_directories(test_cli PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
