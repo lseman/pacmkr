@@ -58,6 +58,7 @@ set(PACMKR_SOURCES
     src/backend/aur.cpp
     src/backend/aur_cache.cpp
     src/backend/deps.cpp
+    src/backend/local_repo.cpp
     src/backend/pacman.cpp
     src/backend/remove.cpp
     src/build/build.cpp

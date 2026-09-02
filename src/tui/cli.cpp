@@ -610,6 +610,7 @@ void print_help() {
         "  -- <KEY=VALUE...>         Extra environment variables for makepkg\n"
         "\n"
         "Examples:\n"
+        "  pacmkr repo help               Manage a custom/local repository\n"
         "  pacmkr -Syu                    Full system upgrade with AUR support\n"
         "  pacmkr -Ss query               Search repos + AUR\n"
         "  pacmkr -Qi package             Show package info\n"

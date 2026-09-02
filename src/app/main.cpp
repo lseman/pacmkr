@@ -13,6 +13,7 @@
 #include "pacmkr/status.h"
 #include "pacmkr/error.h"
 #include "pacmkr/pgp.h"
+#include "pacmkr/local_repo.h"
 
 #include <iostream>
 #include <filesystem>
@@ -1049,6 +1050,12 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> raw_args;
     for (int i = 1; i < argc; ++i) {
         raw_args.push_back(argv[i]);
+    }
+
+    if (!raw_args.empty() && raw_args.front() == "repo") {
+        alpm::shutdown();
+        aur_cache::shutdown();
+        return local_repo::run(raw_args);
     }
 
     // Aur-specific flags: parse as pacmkr CLI, not forward to pacman

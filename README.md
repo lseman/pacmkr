@@ -70,6 +70,23 @@ and packages installed from custom/local PKGBUILDs. Use `-Qmq` for names only.
 
 Run `pacmkr --help` for the complete option reference.
 
+### Local repositories
+
+```bash
+pacmkr repo create myrepo ~/.local/share/pacmkr/myrepo
+pacmkr repo add myrepo ./package-1.0-1-x86_64.pkg.tar.zst
+pacmkr repo remove myrepo package
+pacmkr repo list
+pacmkr repo delete myrepo
+```
+
+`create` registers the directory; the database is generated when the first
+package is added. `add` copies package archives (and adjacent signatures) into
+the repository before indexing them. `delete` unregisters the repository but
+deliberately preserves its database and package files. Add the generated
+database to `pacman.conf` separately when you want pacman to consume it
+system-wide.
+
 ### Build optimization
 
 Optimization flags are applied to packages built by pacmkr, not to prebuilt
