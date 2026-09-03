@@ -65,6 +65,7 @@ void set_bool(Cli& cli, const std::string& flag, bool val) {
     else if (flag == "query-info")        cli.query_info = val;
     else if (flag == "query-list-files")  cli.query_list_files = val;
     else if (flag == "query-mirrors")     cli.query_mirrors = val;
+    else if (flag == "orphans")            cli.query_orphans = val;
     else if (flag == "query-owned")       cli.query_owned = val;
     else if (flag == "query-dependents")  cli.query_dependents = val;
     else if (flag == "query-explicit")    cli.query_explicit = val;
@@ -129,6 +130,8 @@ void set_bool(Cli& cli, const std::string& flag, bool val) {
     else if (flag == "nodownload")       cli.nodownload = val;
     else if (flag == "needed")           cli.needed = val;
     else if (flag == "debug")            cli.debug = val;
+    else if (flag == "json")             cli.json_output = val;
+    else if (flag == "dry-run" || flag == "dryrun" || flag == "dry_run")  cli.dry_run = val;
     else if (flag == "color")            cli.color_flag = val;
     else if (flag == "nocolor")          cli.nocolor_flag = val;
     else if (flag == "all-deps")         cli.all_deps = val;
@@ -190,6 +193,8 @@ constexpr OptDef opts[] = {
     {"--config", nullptr, true},
     {"--add", nullptr, false},
     {"--build", "-B", false},
+    {"--json", nullptr, false},
+    {"--dry-run", nullptr, false},
 
     // AUR integration
     {"--aur", nullptr, false},
@@ -223,6 +228,7 @@ constexpr OptDef opts[] = {
 
     // Installed AUR/local PKGBUILD packages
     {"--list-foreign", nullptr, false},
+    {"--orphans", nullptr, false},
 
     // Build flags
     {"--mflags", nullptr, true},
@@ -629,6 +635,11 @@ void print_help() {
         "      --pgpfetch            Auto-fetch missing PGP keys from keyserver\n"
         "      --keepsrc             Preserve source files after build\n"
         "      --cleanafter          Clean build directory after each package\n"
+        "\n"
+        "Output:\n"
+        "      --json                Machine-readable JSON output\n"
+        "      --dry-run             Preview upgrade without executing\n"
+        "  -Qm, --orphans            List foreign/orphan packages\n"
         "\n"
         "Config:\n"
         "      --config FILE         Alternate config file\n"

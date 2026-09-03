@@ -4,6 +4,7 @@
 #include "pacmkr/backend/aur_cache.h"
 #include "pacmkr/backend/alpm.h"
 #include "pacmkr/backend/deps.h"
+#include "pacmkr/backend/hybrid_search.h"
 #include "pacmkr/core/optimize.h"
 #include "pacmkr/app/operations.h"
 #include "pacmkr/build/pkgbuild.h"
@@ -12,6 +13,7 @@
 #include "pacmkr/build/pgp.h"
 #include "pacmkr/backend/remove.h"
 #include "pacmkr/app/terminal.h"
+#include "pacmkr/app/json_output.h"
 
 #include <iostream>
 #include <iomanip>
@@ -29,12 +31,17 @@
 #include <limits.h>
 #include <unistd.h>
 
+// JSON support — must come after forward-declaring headers.
+#include "json.hpp"
+using json = nlohmann::json;
+
 namespace {
 
 using namespace pacmkr;
 
 // Forward declarations — functions defined later in this file
 int run_upgrade(const cli::Cli& cli);
+int run_upgrade_dry_run(const cli::Cli& cli);
 int run_local_build(const cli::Cli& cli, const config::Config& config);
 int run_aur_build(cli::Cli cli);
 int run_sync_install(const cli::Cli& cli);
@@ -343,6 +350,9 @@ std::string extract_search_query(const std::vector<std::string>& args) {
 
 /// Run a read-only sync operation via alpm.
 int run_sync_read(const std::vector<std::string>& args) {
+    // Check for --json flag
+    bool json_mode = std::find(args.begin(), args.end(), "--json") != args.end();
+
     // Detect sub-operation
     bool do_search = false, do_info = false, do_list = false, do_groups = false;
     int info_level = 0;
@@ -388,80 +398,74 @@ int run_sync_read(const std::vector<std::string>& args) {
                     }
                 }
 
-                // Search repos via alpm
-                auto repo_results = alpm::search_sync(query);
+                // Unified hybrid search: rank repo and AUR results together by relevance
+                auto results = hybrid_search::search(query, limit);
 
-                // Search AUR cache with sort order
-                auto aur_results = aur_cache::search(query, limit, sort_order);
-
-                // Print repo results first
-                unsigned int printed = 0;
-                for (auto& r : repo_results) {
-                    if (printed >= limit) break;
-                    std::cout << r.origin_db << "/" << r.name << "  " << r.version;
-                    if (!r.desc.empty()) std::cout << "    " << r.desc;
-                    std::cout << "\n";
-                    ++printed;
+                // JSON output
+                if (json_mode) {
+                    json j;
+                    j["query"] = query;
+                    j["results"] = json::array();
+                    for (auto& r : results) {
+                        json pkg;
+                        pkg["name"] = r.name;
+                        pkg["version"] = r.version;
+                        if (r.desc) pkg["description"] = *r.desc;
+                        pkg["source"] = (r.source == hybrid_search::Source::Repository) ? "repository" : "aur";
+                        if (r.source == hybrid_search::Source::Repository) {
+                            pkg["origin_db"] = r.origin_db;
+                        } else {
+                            pkg["num_votes"] = r.numvotes;
+                            pkg["popularity"] = r.popularity;
+                        }
+                        pkg["relevance_score"] = r.relevance_score;
+                        j["results"].push_back(pkg);
+                    }
+                    std::cout << json_output::serialize(j) << "\n";
+                } else {
+                    // Print unified results
+                    for (size_t i = 0; i < results.size(); ++i) {
+                        auto& r = results[i];
+                        if (r.source == hybrid_search::Source::Repository) {
+                            std::cout << r.origin_db << "/" << r.name << "  " << r.version;
+                        } else {
+                            std::cout << "aur/" << r.name << "  " << r.version;
+                        }
+                        if (r.desc.has_value() && !r.desc->empty()) {
+                            std::cout << "    " << *r.desc;
+                        }
+                        std::cout << "\n";
+                    }
                 }
 
-                // Print AUR results (skip repos with same name)
-                std::set<std::string> repo_names;
-                for (auto& r : repo_results) repo_names.insert(r.name);
-
-                for (auto& a : aur_results) {
-                    if (printed >= limit) break;
-                    if (repo_names.find(a.name) != repo_names.end()) continue; // Skip duplicates
-                    std::cout << "aur/" << a.name << "  " << a.pkgname;
-                    if (!a.desc.empty()) std::cout << "    " << a.desc;
-                    std::cout << "\n";
-                    ++printed;
-                }
-
-                // Interactive picker in TTY mode
+                // Interactive picker in TTY mode (text only)
                 bool is_tty = isatty(STDIN_FILENO) != 0 && isatty(STDOUT_FILENO) != 0;
-                if (is_tty && !repo_results.empty()) {
+                if (is_tty && !results.empty()) {
                     std::cout << "\n==> Type a number to select, or Enter for first result, Esc to cancel\n";
 
-                    // Collect all results into a single list for selection
-                    struct SearchResultItem {
-                        std::string origin;  // "core/pkg", "extra/pkg", "aur/pkg"
-                        std::string name;
-                        std::string version;
-                        std::string desc;
-                    };
+                    // Simple number-based selection on unified results
+                    std::cout << "\nSelect package [1-" << results.size() << "]: ";
+                    std::string input;
+                    std::getline(std::cin, input);
 
-                    std::vector<SearchResultItem> all_results;
-                    for (auto& r : repo_results) {
-                        all_results.push_back({r.origin_db + "/" + r.name, r.name, r.version, r.desc});
-                    }
-                    for (auto& a : aur_results) {
-                        if (repo_names.find(a.name) == repo_names.end()) {
-                            all_results.push_back({"aur/" + a.name, a.name, "", a.desc});
-                        }
-                    }
-
-                    if (!all_results.empty()) {
-                        // Simple number-based selection
-                        std::cout << "\nSelect package [1-" << all_results.size() << "]: ";
-                        std::string input;
-                        std::getline(std::cin, input);
-
-                        if (!input.empty() && input != "\x1b") {  // Not Esc
-                            try {
-                                unsigned int idx = std::stoul(input) - 1;
-                                if (idx < all_results.size()) {
-                                    std::cout << "\n==> Selected: " << all_results[idx].name << "\n";
-                                    std::cout << "     To install: pacmkr -S " << all_results[idx].name << "\n";
-                                } else {
-                                    std::cout << "Invalid selection.\n";
-                                }
-                            } catch (...) {
-                                // Empty or invalid input - select first by default
-                                if (input.empty()) {
-                                    std::cout << "\n==> Selected: " << all_results[0].name << " (default)\n";
-                                } else {
-                                    std::cout << "Invalid selection.\n";
-                                }
+                    if (!input.empty() && input != "\x1b") {  // Not Esc
+                        try {
+                            unsigned int idx = std::stoul(input) - 1;
+                            if (idx < results.size()) {
+                                auto& r = results[idx];
+                                std::cout << "\n==> Selected: " << r.name << "\n";
+                                std::cout << "     Source: " << (r.source == hybrid_search::Source::Repository ? r.origin_db : "aur") << "\n";
+                                std::cout << "     To install: pacmkr -S " << r.name << "\n";
+                            } else {
+                                std::cout << "Invalid selection.\n";
+                            }
+                        } catch (...) {
+                            // Empty or invalid input - select first by default
+                            if (input.empty()) {
+                                std::cout << "\n==> Selected: " << results[0].name << " (default)\n";
+                                std::cout << "     To install: pacmkr -S " << results[0].name << "\n";
+                            } else {
+                                std::cout << "Invalid selection.\n";
                             }
                         }
                     }
@@ -478,10 +482,35 @@ int run_sync_read(const std::vector<std::string>& args) {
             if (!pkgname.empty()) {
                 auto pkg = alpm::get_sync_package(pkgname);
                 if (pkg) {
-                    print_pkg_info(*pkg, /*repository=*/true, info_level >= 2);
+                    if (json_mode) {
+                        json j;
+                        j["name"] = pkgname;
+                        j["source"] = "repository";
+                        j["package"] = json_output::alpm_package_to_json(*pkg);
+                        std::cout << json_output::serialize(j) << "\n";
+                    } else {
+                        print_pkg_info(*pkg, /*repository=*/true, info_level >= 2);
+                    }
                 } else {
-                    std::cerr << "error: package '" << pkgname << "' not found in any repository\n";
-                    return 1;
+                    // Try AUR
+                    try {
+                        auto info = aur::fetch(pkgname);
+                        if (json_mode) {
+                            json j;
+                            j["name"] = pkgname;
+                            j["source"] = "aur";
+                            j["package"] = json_output::aur_package_info_to_json(info);
+                            std::cout << json_output::serialize(j) << "\n";
+                        } else {
+                            std::cout << "     Name          : " << info.name << "\n"
+                                      << "     Description   : " << (info.desc.value_or("N/A")) << "\n"
+                                      << "     URL           : " << (info.url.value_or("N/A")) << "\n"
+                                      << "     Version       : " << info.version << "\n";
+                        }
+                    } catch (const source_error&) {
+                        std::cerr << "error: package '" << pkgname << "' not found in repos or AUR\n";
+                        return 1;
+                    }
                 }
             }
         }
@@ -511,7 +540,7 @@ int run_sync_read(const std::vector<std::string>& args) {
 /// Run a read-only query operation via alpm.
 int run_query_read(const std::vector<std::string>& args,
                    const std::vector<std::string>& parsed_targets = {}) {
-    bool do_info = false, do_list_files = false, do_mirrors = false, do_owned = false,
+    bool do_info = false, do_list_files = false, do_mirrors = false, do_orphans = false, do_owned = false,
          do_explicit = false, do_upgrades = false, do_search = false,
          do_dependents = false, do_tree = false, do_check = false,
          do_file = false, do_changelog = false,
@@ -520,6 +549,7 @@ int run_query_read(const std::vector<std::string>& args,
 
     for (auto& arg : args) {
         if (arg == "--list-foreign") do_mirrors = true;
+        if (arg == "--orphans")        do_orphans = true;
         if (arg.size() >= 2 && arg[0] == '-' && arg[1] != '-') {
             char primary = arg[1];
             if (primary == 'Q') {
@@ -589,7 +619,7 @@ int run_query_read(const std::vector<std::string>& args,
     const bool has_dt = do_dependents && do_tree;
 
     try {
-        const bool has_filter = do_info || do_list_files || do_mirrors || do_owned || do_explicit ||
+        const bool has_filter = do_info || do_list_files || do_mirrors || do_orphans || do_owned || do_explicit ||
                                 do_upgrades || do_search || do_dependents || do_tree || do_check;
         if (!has_filter) {
             const auto& targets = parsed_targets;
@@ -640,6 +670,25 @@ int run_query_read(const std::vector<std::string>& args,
                 std::cout << pkg.name;
                 if (!do_quiet) std::cout << " " << pkg.version;
                 std::cout << "\n";
+            }
+        }
+
+        if (do_orphans) {
+            // Orphans: foreign packages installed as dependencies that no longer
+            // satisfy any explicit package's requirements.
+            auto orphans = alpm::get_orphan_packages();
+            if (orphans.empty()) {
+                std::cout << "No orphan packages found.\n";
+            } else {
+                std::cout << "Orphan packages (" << orphans.size() << "):\n";
+                for (const auto& pkg : orphans) {
+                    std::cout << pkg.name;
+                    if (!do_quiet) std::cout << " " << pkg.version;
+                    // Show what originally pulled it in, if known
+                    if (!pkg.required_by.empty() && !do_quiet)
+                        std::cout << "  (was required by: " << pkg.required_by.front() << ")";
+                    std::cout << "\n";
+                }
             }
         }
 
@@ -916,6 +965,89 @@ int run_upgrade(const cli::Cli& cli) {
     }
 
     std::cout << "==> Upgrade complete. Repos: 0, AUR: " << aur_count << "\n";
+    return 0;
+}
+
+/// Preview what a system upgrade would do without executing anything.
+int run_upgrade_dry_run(const cli::Cli& cli) {
+    terminal::title("Upgrade preview");
+
+    // Repository upgrades
+    auto repo_upgrades = alpm::get_upgrades();
+    if (!repo_upgrades.empty()) {
+        terminal::section("Repository upgrades (" + std::to_string(repo_upgrades.size()) + ")");
+        for (auto& u : repo_upgrades) {
+            std::cout << "  " << u.name << ": " << u.installed_version << " -> " << u.repo_version << "\n";
+        }
+    } else {
+        terminal::success("Repository packages are already current");
+    }
+
+    // AUR out-of-date check
+    auto ootd_future = deps::detect_out_of_date_async();
+    
+    // Wait for AUR check to complete (it runs on a background thread)
+    std::vector<deps::OutOfDatePkg> ootd;
+    try {
+        ootd = ootd_future.get();
+    } catch (const std::exception& e) {
+        std::cerr << "warning: AUR update check failed: " << e.what() << "\n";
+    }
+
+    // Filter dev packages if --nodevel is set
+    if (cli.nodevel) {
+        ootd.erase(std::remove_if(ootd.begin(), ootd.end(),
+            [](const deps::OutOfDatePkg& p) { return deps::is_dev_package(p.name); }),
+            ootd.end());
+    }
+
+    if (!ootd.empty()) {
+        terminal::section("AUR updates (" + std::to_string(ootd.size()) + ")");
+        for (auto& p : ootd) {
+            std::cout << "  aur/" << p.name << ": " << p.installed_version << " -> " << p.aur_version;
+            if (!p.desc.empty()) std::cout << "  -- " << p.desc;
+            std::cout << "\n";
+        }
+
+        // Show dependency resolution plan
+        std::vector<std::string> names;
+        for (auto& p : ootd) names.push_back(p.name);
+        
+        try {
+            auto graph = deps::resolve(names, true, true, false);
+            if (!graph.conflicts.empty()) {
+                terminal::warning("Dependency conflicts detected:");
+                for (auto& c : graph.conflicts) {
+                    std::cout << "  CONFLICT: " << c.conflicting << " (required by " << c.by << ": " << c.reason << ")\n";
+                }
+            }
+            if (!graph.build_order.empty()) {
+                std::cout << "\n==> Would build " << graph.aur_count() << " AUR package(s):\n";
+                for (size_t i = 0; i < graph.build_order.size(); ++i) {
+                    std::cout << "  " << (i + 1) << ". " << graph.build_order[i];
+                    auto it = graph.nodes.find(graph.build_order[i]);
+                    if (it != graph.nodes.end() && !it->second.aur_deps.empty()) {
+                        std::cout << " [deps: ";
+                        for (size_t j = 0; j < it->second.aur_deps.size(); ++j) {
+                            if (j > 0) std::cout << ", ";
+                            std::cout << it->second.aur_deps[j];
+                        }
+                        std::cout << "]";
+                    }
+                    std::cout << "\n";
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "warning: dependency resolution failed: " << e.what() << "\n";
+        }
+    } else {
+        terminal::success("AUR packages are already current");
+    }
+
+    // Summary
+    std::cout << "\n==> Summary: Repos: " << repo_upgrades.size()
+              << ", AUR: " << ootd.size() << "\n";
+    std::cout << "==> No changes were made.\n";
     return 0;
 }
 
@@ -1232,6 +1364,12 @@ int main(int argc, char* argv[]) {
         }
 
         try {
+            if (cli.dry_run) {
+                int rc = run_upgrade_dry_run(cli);
+                alpm::shutdown();
+                aur_cache::shutdown();
+                return rc;
+            }
             int rc = run_upgrade(cli);
             alpm::shutdown();
             aur_cache::shutdown();
@@ -1382,7 +1520,7 @@ int main(int argc, char* argv[]) {
                       << human_size(result.bytes_freed) << " reclaimed\n";
             return 0;
         } else if (cli.search.has_value()) {
-            aur::search_aur(*cli.search, cli.limit);
+            aur::search_aur(*cli.search, cli.limit, cli.json_output);
         } else if (cli.refresh) {
             // Refresh AUR cache before upgrade
             aur_cache::refresh();

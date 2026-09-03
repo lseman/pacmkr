@@ -15,16 +15,23 @@ struct BuildOrchestrator {
     BuildOrchestrator(const cli::Cli& cli, const config::Config& config,
                       pkgbuild::Pkgbuild pkgbuild);
 
-    /// Run the full build pipeline.
+    /// Run the full build pipeline with retry support.
     int run();
 
     /// Get the package version string.
     std::string version() const;
 
+    /// Number of retries attempted (set by run()).
+    int retries_attempted() const { return retries_; }
+
 private:
+    std::filesystem::path log_dir_{};
+    int retries_{0};
     void setup_environment();
     int run_function(const std::string& func_name, const std::filesystem::path& srcdir,
                      const std::filesystem::path& pkgdir = {}, bool fakeroot = false);
+    int run_with_retry(const std::string& func_name, const std::filesystem::path& srcdir,
+                       const std::filesystem::path& pkgdir = {}, bool fakeroot = false);
 };
 
 /// Check that required tools are available.

@@ -17,6 +17,7 @@
 #include <system_error>
 #include <unordered_set>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/utsname.h>
 #include <utility>
 
@@ -45,6 +46,52 @@ static void require_root() {
     if (geteuid() != 0 && !isolated_root) {
         throw alpm_error("this operation modifies the system; run pacmkr as root");
     }
+}
+
+/// Check for a stale pacman lock file. Returns true when a stale lock is found.
+/// A lock file containing a PID of a non-existent process is considered stale.
+static bool check_stale_lock() {
+    const std::filesystem::path lock_path = "/var/lib/pacman/db.lck";
+    if (!std::filesystem::exists(lock_path)) return false;
+
+    // Read the PID from the lock file (pacman writes its PID)
+    std::ifstream lock_file(lock_path);
+    if (!lock_file) return false;
+
+    std::string pid_str;
+    lock_file >> pid_str;
+    if (pid_str.empty()) {
+        // Empty lock file — definitely stale
+        terminal::warning("Stale lock file detected (empty); removing");
+        std::error_code ec;
+        std::filesystem::remove(lock_path, ec);
+        return true;
+    }
+
+    // Check if the PID is still running
+    int pid;
+    try {
+        pid = std::stoi(pid_str);
+    } catch (...) {
+        terminal::warning("Stale lock file detected (invalid PID '" + pid_str + "'); removing");
+        std::error_code ec;
+        std::filesystem::remove(lock_path, ec);
+        return true;
+    }
+
+    // kill(0) checks if the process exists without actually sending a signal
+    if (kill(pid, 0) != 0 && errno == ESRCH) {
+        terminal::warning("Stale lock file detected (PID " + std::to_string(pid)
+                          + " not running); removing");
+        std::error_code ec;
+        std::filesystem::remove(lock_path, ec);
+        return true;
+    }
+
+    // Process is still running — another package manager may be active
+    terminal::warning("Lock file exists (PID " + std::to_string(pid)
+                      + " is running). Another package manager may be in use.");
+    return false;
 }
 
 static std::string last_error(const std::string& action) {
@@ -189,6 +236,7 @@ static void download_callback(void*, const char* filename,
 struct Transaction {
     explicit Transaction(int flags, bool no_confirm) {
         require_root();
+        check_stale_lock();
         g_no_confirm = no_confirm;
         if (alpm_trans_init(g_handle, flags) < 0) throw alpm_error(last_error("cannot start transaction"));
     }

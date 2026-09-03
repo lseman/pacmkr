@@ -30,7 +30,9 @@ struct SearchResult {
     std::string pkgname;
     std::string desc;
     unsigned int numvotes;
+    double popularity{0.0};             // AUR v5 Popularity score
     unsigned long long outofdate_ts{};  // For --sortby=updated
+    double relevance_score{0.0};        // Fuzzy search relevance score
 };
 std::vector<SearchResult> search(const std::string& query, unsigned int limit = 10, SortOrder order = SortOrder::Votes);
 

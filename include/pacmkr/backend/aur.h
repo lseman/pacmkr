@@ -5,8 +5,8 @@
 #include <vector>
 #include <filesystem>
 
-// Forward declarations — nlohmann/json will be included in the .cpp
-struct json;
+// Forward declarations
+// Note: nlohmann::json is pulled in via httplib.h or json.hpp in .cpp files.
 
 namespace pacmkr::aur {
 
@@ -17,6 +17,8 @@ struct AurPackage {
     std::optional<std::string> desc;
     std::optional<std::string> url;
     unsigned int numvotes{0};
+    double popularity{0.0};     // AUR v5 API Popularity score (0-∞)
+    double relevance_score{0.0}; // Client-side fuzzy match score
     std::optional<unsigned long long> outofdate;
     std::optional<unsigned long long> firstsubmitted;
     unsigned long long lastmodified{};
@@ -71,12 +73,12 @@ bool is_official_package(const std::string& pkgname);
 bool is_aur_package(const std::string& pkgname);
 
 /// Display search results (interactive or list mode).
-void search_aur(const std::string& query, unsigned int limit);
+void search_aur(const std::string& query, unsigned int limit, bool json_mode = false);
 
 /// Hybrid sync search: query both official repos and AUR.
-void hybrid_sync_search(const std::string& query, unsigned int limit);
+void hybrid_sync_search(const std::string& query, unsigned int limit, bool json_mode = false);
 
 /// Hybrid sync info: query both official repos and AUR for a package.
-void hybrid_sync_info(const std::string& pkgname);
+void hybrid_sync_info(const std::string& pkgname, bool json_mode = false);
 
 } // namespace pacmkr::aur

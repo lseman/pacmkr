@@ -21,9 +21,12 @@ packages are resolved and built in dependency order.
 
 - Pacman-style commands, including `-Syu`, `-Ss`, `-Q`, and `-Rns`
 - Atomic native repository refresh and upgrade through libalpm
-- Unified official repository and AUR search
+- Fuzzy search with Levenshtein distance scoring and typo tolerance
+- Hybrid repo/AUR ranking: unified relevance-sorted results across both sources
 - Transitive AUR dependency resolution with topological build ordering
 - PKGBUILD parsing, source verification, packaging, and installation
+- Disk space pre-check before builds (aborts early if insufficient)
+- Build retry with exponential backoff for transient failures
 - Optional LTO, mold, GCC Graphite, and LLVM Polly build optimization
 - Plain-text command output suitable for terminals, logs, and scripts
 - Optional GTK4 desktop dashboard
@@ -86,6 +89,12 @@ pacmkr --aur --aur-deps package-name
 # Inspect foreign packages and remove a package cleanly
 pacmkr -Qm
 sudo pacmkr -Rns package-name
+
+# Preview an upgrade without executing it
+pacmkr --dry-run -Syu
+
+# List orphan packages (foreign deps no longer required)
+pacmkr --orphans
 ```
 
 `pacmkr -Qm` (or `pacmkr --list-foreign`) lists every installed package
@@ -93,6 +102,38 @@ that is absent from the configured repositories. This includes AUR packages
 and packages installed from custom/local PKGBUILDs. Use `-Qmq` for names only.
 
 Run `pacmkr --help` for the complete option reference.
+
+### Search behavior
+
+**Fuzzy matching**: pacmkr scores search results using Levenshtein edit distance,
+so typos like `"termnal"` still match `"terminal"` with a high relevance score.
+Multi-word queries require every word to match, and name matches rank above
+description matches.
+
+**Unified ranking**: `-Ss` no longer shows repository results first and AUR
+results second. Instead, repo and AUR packages are scored together and sorted
+by relevance, with repository packages breaking ties when scores are equal.
+
+**JSON output**: use `--json` for machine-readable search results:
+
+```bash
+pacmkr -Ss --json terminal | jq '.results[] | select(.source == "aur")'
+```
+
+### Build resilience
+
+**Disk space pre-check**: before invoking makepkg, pacmkr verifies that the
+build directory and package destination have at least 2 GB free. Use a custom
+threshold by setting `min_space` in your config file.
+
+**Retry with backoff**: transient build failures (network timeouts, OOM kills,
+GPG keyring issues) are automatically retried up to 2 times with exponential
+backoff (1 s → 3 s → 9 s). Build logs for every attempt are saved under
+`~/.cache/pacmkr/logs/`.
+
+**Dry-run upgrade preview**: `--dry-run` shows exactly what a `-Syu` would change
+— repository upgrades, AUR out-of-date packages, dependency resolution plan, and
+any conflicts — without executing any transaction or build.
 
 ### Local repositories
 

@@ -1,7 +1,12 @@
 #include "pacmkr/backend/aur.h"
 #include "pacmkr/backend/alpm.h"
 #include "pacmkr/core/error.h"
+#include "pacmkr/core/fuzzy_search.h"
 #include "pacmkr/app/terminal.h"
+#include "pacmkr/app/json_output.h"
+
+// json.hpp is included via json_output.h; just alias it here.
+using json = nlohmann::json;
 
 #include <httplib.h>
 #include <json.hpp>
@@ -106,6 +111,7 @@ AurPackage pkg_from_json(const nlohmann::json& obj) {
     pkg.desc         = get_optional<std::string>(obj["Description"]);
     pkg.url          = get_optional<std::string>(obj["URL"]);
     pkg.numvotes     = get_or(obj["NumVotes"], 0u);
+    pkg.popularity   = obj.contains("Popularity") && obj["Popularity"].is_number() ? obj["Popularity"].get<double>() : 0.0;
     pkg.outofdate    = get_optional<unsigned long long>(obj["OutOfDate"]);
     pkg.firstsubmitted = get_optional<unsigned long long>(obj["FirstSubmitted"]);
     pkg.lastmodified = get_or(obj["LastModified"], 0ULL);
@@ -191,9 +197,24 @@ std::vector<AurPackage> search(const std::string& query) {
         results.push_back(pkg_from_json(item));
     }
 
-    // Sort by votes descending
+    // Apply fuzzy scoring to rank by relevance to query
+    for (auto& pkg : results) {
+        std::string text = pkg.name;
+        if (pkg.desc.has_value()) {
+            text += " " + *pkg.desc;
+        }
+        auto score = fuzzy::score_match(query, text);
+        pkg.relevance_score = score.score;
+    }
+
+    // Sort by relevance (primary), then popularity, then votes
+    // Relevance handles typos and partial matches; popularity/votes break ties
     std::sort(results.begin(), results.end(),
               [](const AurPackage& a, const AurPackage& b) {
+                  if (a.relevance_score != b.relevance_score)
+                      return a.relevance_score > b.relevance_score;
+                  if (a.popularity != b.popularity)
+                      return a.popularity > b.popularity;
                   return a.numvotes > b.numvotes;
               });
 
@@ -260,11 +281,27 @@ bool is_aur_package(const std::string& pkgname) {
     }
 }
 
-void search_aur(const std::string& query, unsigned int limit) {
+void search_aur(const std::string& query, unsigned int limit, bool json_mode) {
     auto results = search(query);
 
     if (results.empty()) {
-        std::cout << "No results found for '" << query << "'\n";
+        if (json_mode) {
+            json j;
+            j["query"] = query;
+            j["results"] = json::array();
+            std::cout << json_output::serialize(j) << "\n";
+        } else {
+            std::cout << "No results found for '" << query << "'\n";
+        }
+        return;
+    }
+
+    // JSON mode: output structured data and skip interactive picker
+    if (json_mode) {
+        json j;
+        j["query"] = query;
+        j["results"] = json_output::aur_search_results_to_json(results);
+        std::cout << json_output::serialize(j) << "\n";
         return;
     }
 
@@ -281,7 +318,9 @@ void search_aur(const std::string& query, unsigned int limit) {
             auto desc = results[i].desc.value_or("No description");
             if (desc.size() > 60) desc = desc.substr(0, 57) + "...";
             std::cout << "  " << (i + 1) << ". " << results[i].name
-                      << " — " << desc << " (votes: " << results[i].numvotes << ")\n";
+                      << " — " << desc << " (votes: " << results[i].numvotes
+                      << ", pop: " << results[i].popularity
+                      << ", rel: " << results[i].relevance_score << ")\n";
         }
 
         std::cout << "\nSelect: ";
@@ -309,13 +348,15 @@ void search_aur(const std::string& query, unsigned int limit) {
             auto desc = results[i].desc.value_or("No description");
             if (desc.size() > 60) desc = desc.substr(0, 57) + "...";
             std::cout << "  " << (i + 1) << ". " << results[i].name
-                      << " — " << desc << " (votes: " << results[i].numvotes << ")\n";
+                      << " — " << desc << " (votes: " << results[i].numvotes
+                      << ", pop: " << results[i].popularity
+                      << ", rel: " << results[i].relevance_score << ")\n";
         }
         std::cout << "\nTo build a package: pacmkr --aur <package-name>\n";
     }
 }
 
-void hybrid_sync_search(const std::string& query, unsigned int limit) {
+void hybrid_sync_search(const std::string& query, unsigned int limit, bool json_mode) {
     auto repo_results = alpm::search_sync(query);
 
     // Query AUR
@@ -324,6 +365,14 @@ void hybrid_sync_search(const std::string& query, unsigned int limit) {
         aur_results = search(query);
     } catch (...) {
         // AUR query failed — still show repo results
+    }
+
+    // JSON mode: output structured data
+    if (json_mode) {
+        json j = json_output::hybrid_search_to_json(repo_results, aur_results);
+        j["query"] = query;
+        std::cout << json_output::serialize(j) << "\n";
+        return;
     }
 
     // Display combined results
@@ -351,12 +400,42 @@ void hybrid_sync_search(const std::string& query, unsigned int limit) {
             auto desc = aur_results[i].desc.value_or("No description");
             if (desc.size() > 60) desc = desc.substr(0, 57) + "...";
             std::cout << "  aur/" << aur_results[i].name
-                      << " — " << desc << " (votes: " << aur_results[i].numvotes << ")\n";
+                      << " — " << desc << " (votes: " << aur_results[i].numvotes
+                      << ", pop: " << aur_results[i].popularity
+                      << ", rel: " << aur_results[i].relevance_score << ")\n";
         }
     }
 }
 
-void hybrid_sync_info(const std::string& pkgname) {
+void hybrid_sync_info(const std::string& pkgname, bool json_mode) {
+    // JSON mode
+    if (json_mode) {
+        json j;
+        j["name"] = pkgname;
+        auto repo_pkg = alpm::get_sync_package(pkgname);
+        if (repo_pkg) {
+            j["source"] = "repository";
+            j["package"] = json_output::alpm_package_to_json(*repo_pkg);
+            std::cout << json_output::serialize(j) << "\n";
+            return;
+        }
+        // Try AUR
+        try {
+            auto info = fetch(pkgname);
+            j["source"] = "aur";
+            j["package"] = json_output::aur_package_info_to_json(info);
+            std::cout << json_output::serialize(j) << "\n";
+            return;
+        } catch (const source_error&) {
+            j["source"] = "not_found";
+            j["error"] = "package not found in repos or AUR";
+            std::cout << json_output::serialize(j) << "\n";
+            std::cerr << "error: package '" << pkgname << "' not found in repos or AUR\n";
+        }
+        return;
+    }
+
+    // Text mode
     if (auto pkg = alpm::get_sync_package(pkgname)) {
         std::cout << "Repository      : " << pkg->origin_db << "\n"
                   << "Name            : " << pkg->name << "\n"

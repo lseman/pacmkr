@@ -38,16 +38,20 @@ set(PACMKR_SOURCES
     src/app/main.cpp
     src/app/operations.cpp
     src/app/terminal.cpp
+    src/app/json_output.cpp
     src/backend/alpm.cpp
     src/backend/aur.cpp
     src/backend/aur_cache.cpp
     src/backend/deps.cpp
+    src/backend/hybrid_search.cpp
     src/backend/remove.cpp
     src/build/build.cpp
     src/build/pgp.cpp
     src/build/pkgbuild.cpp
     src/build/source.cpp
     src/core/config.cpp
+    src/core/disk.cpp
+    src/core/fuzzy_search.cpp
     src/core/optimize.cpp
     src/core/package.cpp
     src/core/pacman_config.cpp
@@ -187,6 +191,7 @@ if(PACMKR_BUILD_GTK_GUI)
         src/gui/gtk/main.cpp
         src/gui/gtk/backend.cpp
         src/app/terminal.cpp
+        src/app/json_output.cpp
         ${PACMKR_GTK_GUI_RESOURCES}
         src/backend/alpm.cpp
         src/backend/aur.cpp

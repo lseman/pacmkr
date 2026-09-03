@@ -101,6 +101,7 @@ struct Cli {
     bool query_owned{false};              // -Qo FILE
     bool query_dependents{false};         // -Qd
     bool query_explicit{false};           // -Qe (explicitly installed)
+    bool query_orphans{false};            // -Qm or --orphans (foreign packages not required)
     bool query_upgrades{false};           // -Qu
     bool query_search{false};             // -Qs
     bool query_check{false};              // -Qk (check integrity)
@@ -160,6 +161,10 @@ struct Cli {
     // ─── Search options ────────────────────────────────────────────
     enum class SortBy { Votes, Updated, Popular };
     SortBy sort_by{SortBy::Votes};        // --sortby
+
+    // ─── Output format ───────────────────────────────────────────
+    bool json_output{false};              // --json: machine-readable JSON output
+    bool dry_run{false};                  // --dry-run: preview without executing
 
     // ─── Diagnostics ──────────────────────────────────────────────
     bool show_flags{false};               // --flags: print the flags used to build packages

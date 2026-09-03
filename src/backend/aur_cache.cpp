@@ -1,5 +1,6 @@
 #include "pacmkr/backend/aur_cache.h"
 #include "pacmkr/core/error.h"
+#include "pacmkr/core/fuzzy_search.h"
 
 #include <map>
 #include <httplib.h>
@@ -218,42 +219,46 @@ std::optional<nlohmann::json> get(const std::string& name) {
 }
 
 std::vector<SearchResult> search(const std::string& query, unsigned int limit, SortOrder order) {
-    std::vector<SearchResult> results;
-    std::string q_lower = query;
-    std::transform(q_lower.begin(), q_lower.end(), q_lower.begin(), ::tolower);
+    if (query.empty()) return {};
 
+    // Build items list for fuzzy search: (name, description)
+    std::vector<std::pair<std::string, std::string>> items;
+    items.reserve(g_aur_data.size());
+    
     for (auto& [name, pkg] : g_aur_data) {
-        bool matched = false;
-
-        // Check name
-        if (!name.empty()) {
-            std::string n_lower = name;
-            std::transform(n_lower.begin(), n_lower.end(), n_lower.begin(), ::tolower);
-            if (n_lower.find(q_lower) != std::string::npos) {
-                matched = true;
-            }
+        std::string desc = "";
+        if (pkg.contains("Description") && pkg["Description"].is_string()) {
+            desc = pkg["Description"].get<std::string>();
         }
+        items.push_back({name, desc});
+    }
 
-        // Check description
-        if (!matched && pkg.contains("Description")) {
-            std::string desc = pkg["Description"].get<std::string>();
-            std::transform(desc.begin(), desc.end(), desc.begin(), ::tolower);
-            if (desc.find(q_lower) != std::string::npos) {
-                matched = true;
-            }
-        }
+    // Perform fuzzy search
+    auto fuzzy_results = fuzzy::search_fuzzy(items, query, limit * 3);  // Get extra candidates for post-filtering
 
-        if (matched) {
-            SearchResult sr{};
-            sr.name = name;
-            sr.pkgname = pkg.value("PackageBase", name);
-            sr.desc = pkg.value("Description", "");
-            sr.numvotes = pkg.value("NumVotes", 0u);
-            sr.outofdate_ts = pkg.value("OutOfDate", 0ULL);
-            results.push_back(std::move(sr));
+    if (fuzzy_results.empty()) return {};
 
-            if (results.size() >= limit) break;
-        }
+    // Convert to SearchResult with metadata from JSON
+    std::vector<SearchResult> results;
+    results.reserve(fuzzy_results.size());
+
+    for (auto& fr : fuzzy_results) {
+        auto it = g_aur_data.find(fr.name);
+        if (it == g_aur_data.end()) continue;
+
+        const auto& pkg = it->second;
+        SearchResult sr{};
+        sr.name = fr.name;
+        sr.pkgname = pkg.value("PackageBase", fr.name);
+        sr.desc = pkg.value("Description", "");
+        sr.numvotes = pkg.value("NumVotes", 0u);
+        sr.popularity = pkg.contains("Popularity") && pkg["Popularity"].is_number() 
+                        ? pkg["Popularity"].get<double>() : 0.0;
+        sr.outofdate_ts = pkg.value("OutOfDate", 0ULL);
+        sr.relevance_score = fr.score;
+        results.push_back(sr);
+
+        if (results.size() >= limit) break;
     }
 
     // Sort based on requested order
@@ -261,13 +266,16 @@ std::vector<SearchResult> search(const std::string& query, unsigned int limit, S
         case SortOrder::Votes:
             std::sort(results.begin(), results.end(),
                       [](const SearchResult& a, const SearchResult& b) {
+                          if (a.relevance_score != b.relevance_score) 
+                              return a.relevance_score > b.relevance_score;
                           return a.numvotes > b.numvotes;
                       });
             break;
         case SortOrder::Updated:
-            // Sort by last update timestamp (descending), outofdate_ts = 0 means never updated
             std::sort(results.begin(), results.end(),
                       [](const SearchResult& a, const SearchResult& b) {
+                          if (a.relevance_score != b.relevance_score)
+                              return a.relevance_score > b.relevance_score;
                           if (a.outofdate_ts == 0 && b.outofdate_ts == 0) return a.name < b.name;
                           if (a.outofdate_ts == 0) return false;
                           if (b.outofdate_ts == 0) return true;
@@ -275,9 +283,12 @@ std::vector<SearchResult> search(const std::string& query, unsigned int limit, S
                       });
             break;
         case SortOrder::Popular:
-            // Same as votes for now (could use Flairs/Popularity field if available)
             std::sort(results.begin(), results.end(),
                       [](const SearchResult& a, const SearchResult& b) {
+                          if (a.relevance_score != b.relevance_score)
+                              return a.relevance_score > b.relevance_score;
+                          if (a.popularity != b.popularity)
+                              return a.popularity > b.popularity;
                           return a.numvotes > b.numvotes;
                       });
             break;
