@@ -1,9 +1,10 @@
-#include "pacmkr/aur.h"
-#include "pacmkr/alpm.h"
-#include "pacmkr/error.h"
+#include "pacmkr/backend/aur.h"
+#include "pacmkr/backend/alpm.h"
+#include "pacmkr/core/error.h"
+#include "pacmkr/app/terminal.h"
 
 #include <httplib.h>
-#include <nlohmann/json.hpp>
+#include <json.hpp>
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
@@ -11,13 +12,33 @@
 #include <fstream>
 #include <thread>
 #include <chrono>
+#include <cerrno>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace pacmkr::aur {
 
 
 namespace {
 
-const char* AUR_API_BASE = "https://aur.archlinux.org/rpc?v=5";
+const char* AUR_API_ORIGIN = "https://aur.archlinux.org";
+
+int run_process(const std::vector<std::string>& args) {
+    if (args.empty()) return 127;
+    const pid_t child = fork();
+    if (child < 0) return 127;
+    if (child == 0) {
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 1);
+        for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv.front(), argv.data());
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128;
+}
 
 /// Read a JSON value with a safe fallback.
 template<typename T>
@@ -33,23 +54,6 @@ std::optional<T> get_optional(const nlohmann::json& v) {
     try { return v.get<T>(); } catch (...) { return std::nullopt; }
 }
 
-std::string encode(const std::string& s) {
-    // Simple URL encoding — only encode special characters
-    static const std::string safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.";
-    std::string result;
-    for (char c : s) {
-        if (safe.find(c) != std::string::npos) {
-            result += c;
-        } else {
-            result += '%';
-            char hex[3];
-            std::snprintf(hex, sizeof(hex), "%02X", static_cast<unsigned char>(c));
-            result += hex;
-        }
-    }
-    return result;
-}
-
 AurPackageInfo info_from_json(const nlohmann::json& obj) {
     AurPackageInfo info{};
 
@@ -59,9 +63,11 @@ AurPackageInfo info_from_json(const nlohmann::json& obj) {
     };
 
     auto get_vec = [&obj](const std::string& key) -> std::vector<std::string> {
-        if (!obj.is_object() && obj.find(key) != obj.end() || !obj[key].is_array()) return {};
+        if (!obj.is_object()) return {};
+        const auto value = obj.find(key);
+        if (value == obj.end() || !value->is_array()) return {};
         std::vector<std::string> result;
-        for (auto& item : obj[key]) {
+        for (const auto& item : *value) {
             if (item.is_string()) result.push_back(item.get<std::string>());
         }
         return result;
@@ -69,6 +75,7 @@ AurPackageInfo info_from_json(const nlohmann::json& obj) {
 
     info.name          = get_or(obj["Name"], std::string{});
     info.pkgname       = get_or(obj["PackageBase"], std::string{});
+    info.version       = get_or(obj["Version"], std::string{});
     info.desc          = get_str("Description");
     info.url           = get_str("URL");
     info.license       = get_vec("License");
@@ -107,9 +114,10 @@ AurPackage pkg_from_json(const nlohmann::json& obj) {
 
 /// Make an HTTP GET request to the AUR API with retries.
 nlohmann::json aur_get(const std::string& path) {
-    static httplib::Client cli(AUR_API_BASE);
+    static httplib::Client cli(AUR_API_ORIGIN);
     cli.set_connection_timeout(std::chrono::seconds(5));
     cli.set_read_timeout(std::chrono::seconds(15));
+    cli.set_write_timeout(std::chrono::seconds(5));
 
     constexpr int max_retries = 3;
     for (int attempt = 0; attempt < max_retries; ++attempt) {
@@ -146,15 +154,17 @@ std::filesystem::path clone_aur_repo(const std::string& pkgname,
     auto pkgdir = dest / pkgname;
 
     if (std::filesystem::exists(pkgdir)) {
-        std::cout << "==> Using existing directory: " << pkgdir.string() << "\n";
+        if (!std::filesystem::is_directory(pkgdir / ".git"))
+            throw source_error("Existing path is not an AUR Git repository: " + pkgdir.string());
+        terminal::info("Updating " + pkgname);
+        if (run_process({"git", "-C", pkgdir.string(), "pull", "--ff-only"}) != 0) {
+            throw source_error("Failed to update existing AUR repository for " + pkgname);
+        }
     } else {
-        std::cout << "==> Cloning AUR repository for " << pkgname << "...\n";
-        std::ostringstream cmd;
-        cmd << "git clone --depth 1 \"https://aur.archlinux.org/" << pkgname << ".git\" \""
-            << pkgdir.string() << "\" 2>&1";
-
-        int rc = std::system(cmd.str().c_str());
-        if (rc != 0) {
+        terminal::info("Cloning " + pkgname);
+        if (run_process({"git", "clone", "--depth", "1", "--",
+                         "https://aur.archlinux.org/" + pkgname + ".git",
+                         pkgdir.string()}) != 0) {
             throw source_error("Failed to clone AUR repository for " + pkgname);
         }
     }
@@ -172,7 +182,7 @@ std::filesystem::path clone_aur_repo(const std::string& pkgname,
 // ─── Public API ──────────────────────────────────────────────────────
 
 std::vector<AurPackage> search(const std::string& query) {
-    auto data = aur_get("/search?type=byname&arg=" + encode(query));
+    auto data = aur_get("/rpc?v=5&type=search&by=name-desc&arg=" + detail::url_encode(query));
 
     if (!data.contains("results")) return {};
 
@@ -191,13 +201,38 @@ std::vector<AurPackage> search(const std::string& query) {
 }
 
 AurPackageInfo fetch(const std::string& pkgname) {
-    auto data = aur_get("/info?arg=" + encode(pkgname));
+    auto data = aur_get("/rpc?v=5&type=info&arg[]=" + detail::url_encode(pkgname));
 
     if (!data.contains("results") || data["results"].empty()) {
         throw source_error("Package '" + pkgname + "' not found in AUR");
     }
 
     return info_from_json(data["results"][0]);
+}
+
+std::vector<AurPackageInfo> fetch_batch(const std::vector<std::string>& pkgnames) {
+    if (pkgnames.empty()) return {};
+
+    // Build batch path: /rpc?v=5&type=info&arg[]=foo&arg[]=bar...
+    std::string path = "/rpc?v=5&type=info";
+    for (const auto& name : pkgnames) {
+        path += "&arg[]=" + detail::url_encode(name);
+    }
+
+    auto data = aur_get(path);
+
+    if (!data.contains("results") || !data["results"].is_array()) {
+        return {};
+    }
+
+    std::vector<AurPackageInfo> results;
+    results.reserve(data["results"].size());
+    for (auto& item : data["results"]) {
+        if (item.contains("Name") && item["Name"].is_string()) {
+            results.push_back(info_from_json(item));
+        }
+    }
+    return results;
 }
 
 std::filesystem::path download_pkgbuild(const std::string& pkgname,
@@ -281,18 +316,7 @@ void search_aur(const std::string& query, unsigned int limit) {
 }
 
 void hybrid_sync_search(const std::string& query, unsigned int limit) {
-    // Query official repos
-    std::ostringstream repo_cmd;
-    repo_cmd << "pacman -Ss \"" << query << "\" 2>/dev/null";
-    FILE* repo_pipe = popen(repo_cmd.str().c_str(), "r");
-    std::string repo_results;
-    if (repo_pipe) {
-        char buf[256];
-        while (fgets(buf, sizeof(buf), repo_pipe)) {
-            repo_results += buf;
-        }
-        pclose(repo_pipe);
-    }
+    auto repo_results = alpm::search_sync(query);
 
     // Query AUR
     std::vector<AurPackage> aur_results;
@@ -314,7 +338,10 @@ void hybrid_sync_search(const std::string& query, unsigned int limit) {
     unsigned int aur_count = std::min(limit, static_cast<unsigned int>(aur_results.size()));
 
     if (has_repo) {
-        std::cout << repo_results;
+        for (const auto& pkg : repo_results) {
+            std::cout << pkg.origin_db << "/" << pkg.name << " " << pkg.version << "\n"
+                      << "    " << pkg.desc << "\n";
+        }
     }
 
     if (has_aur) {
@@ -330,21 +357,14 @@ void hybrid_sync_search(const std::string& query, unsigned int limit) {
 }
 
 void hybrid_sync_info(const std::string& pkgname) {
-    // Try official repos first
-    std::ostringstream repo_cmd;
-    repo_cmd << "pacman -Si \"" << pkgname << "\" 2>/dev/null";
-    FILE* repo_pipe = popen(repo_cmd.str().c_str(), "r");
-    if (repo_pipe) {
-        char buf[256];
-        bool has_output = false;
-        while (fgets(buf, sizeof(buf), repo_pipe)) {
-            has_output = true;
-            std::cout << buf;
-        }
-        int rc = pclose(repo_pipe);
-        if (has_output && WEXITSTATUS(rc) == 0) {
-            return; // Found in official repos
-        }
+    if (auto pkg = alpm::get_sync_package(pkgname)) {
+        std::cout << "Repository      : " << pkg->origin_db << "\n"
+                  << "Name            : " << pkg->name << "\n"
+                  << "Version         : " << pkg->version << "\n"
+                  << "Description     : " << pkg->desc << "\n"
+                  << "Architecture    : " << pkg->arch << "\n"
+                  << "URL             : " << pkg->url << "\n";
+        return;
     }
 
     // Try AUR

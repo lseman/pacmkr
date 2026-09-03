@@ -1,20 +1,241 @@
-#include "pacmkr/alpm.h"
-#include "pacmkr/error.h"
-#include "pacmkr/pacman_config.h"
+#include "pacmkr/backend/alpm.h"
+#include "pacmkr/core/error.h"
+#include "pacmkr/core/pacman_config.h"
+#include "pacmkr/app/terminal.h"
 
 #include <alpm.h>
 #include <alpm_list.h>
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <system_error>
+#include <unordered_set>
+#include <unistd.h>
+#include <sys/utsname.h>
 #include <utility>
 
 namespace pacmkr::alpm {
 
 static alpm_handle_t* g_handle{nullptr};
 static std::function<void(int, const char*)> g_log_cb;
+static bool g_no_confirm{false};
+static std::vector<std::string> g_hold_packages;
+static std::mutex g_warning_mutex;
+static std::unordered_set<std::string> g_emitted_warnings;
+
+static void clear_emitted_warnings() {
+    std::lock_guard<std::mutex> lock(g_warning_mutex);
+    g_emitted_warnings.clear();
+}
+
+static void emit_warning_once(const std::string& message) {
+    std::lock_guard<std::mutex> lock(g_warning_mutex);
+    if (g_emitted_warnings.insert(message).second) terminal::warning(message);
+}
+
+static void require_root() {
+    const char* configured_root = g_handle ? alpm_option_get_root(g_handle) : nullptr;
+    const bool isolated_root = configured_root && std::string(configured_root) != "/";
+    if (geteuid() != 0 && !isolated_root) {
+        throw alpm_error("this operation modifies the system; run pacmkr as root");
+    }
+}
+
+static std::string last_error(const std::string& action) {
+    const auto error = alpm_errno(g_handle);
+    std::string message = action + ": " + alpm_strerror(error);
+    if (error == ALPM_ERR_HANDLE_LOCK) {
+        const char* lockfile = alpm_option_get_lockfile(g_handle);
+        message += ". Another package transaction may be running";
+        if (lockfile) message += "; lock file: " + std::string(lockfile);
+        message += ". If no package manager is running, remove the stale lock file manually";
+    }
+    return message;
+}
+
+static void question_callback(void*, alpm_question_t* question) {
+    if (!question) return;
+    if (question->type == ALPM_QUESTION_SELECT_PROVIDER) {
+        question->select_provider.use_index = 0;
+        return;
+    }
+    if (g_no_confirm) { question->any.answer = 1; return; }
+    const char* prompt = "Accept the requested transaction change?";
+    switch (question->type) {
+        case ALPM_QUESTION_INSTALL_IGNOREPKG: prompt = "Install an ignored package?"; break;
+        case ALPM_QUESTION_REPLACE_PKG: prompt = "Replace the installed package?"; break;
+        case ALPM_QUESTION_CONFLICT_PKG: prompt = "Remove the conflicting package?"; break;
+        case ALPM_QUESTION_CORRUPTED_PKG: prompt = "Delete the corrupted package file?"; break;
+        case ALPM_QUESTION_REMOVE_PKGS: prompt = "Skip packages with unresolved dependencies?"; break;
+        case ALPM_QUESTION_IMPORT_KEY: prompt = "Import the required signing key?"; break;
+        default: break;
+    }
+    if (!isatty(STDIN_FILENO)) { question->any.answer = 0; return; }
+    std::cout << prompt << " [Y/n] " << std::flush;
+    std::string answer;
+    std::getline(std::cin, answer);
+    question->any.answer = answer.empty() || (answer[0] != 'n' && answer[0] != 'N');
+}
+
+static void progress_callback(void*, alpm_progress_t event, const char* pkg,
+                              int percent, size_t total, size_t current) {
+    // libalpm drives each transaction phase (keyring/integrity/load/conflict/
+    // diskspace checks, then the per-package add/upgrade) from 0 to 100 and calls
+    // this callback on every tick — including several times at 100%.  Treating
+    // "percent == 100" as the line terminator therefore stacks a fresh progress
+    // bar on every trailing tick.  Instead, key the bar on (phase, package):
+    // redraw it in place while that identity holds, emit the closing newline the
+    // first time it reaches 100%, and drop the redundant 100% ticks that follow.
+    static alpm_progress_t current_event{};
+    static std::string current_label;
+    static bool current_done{false};
+
+    const char* phase = nullptr;
+    switch (event) {
+        case ALPM_PROGRESS_KEYRING_START:   phase = "Checking keyring"; break;
+        case ALPM_PROGRESS_INTEGRITY_START: phase = "Checking integrity"; break;
+        case ALPM_PROGRESS_LOAD_START:      phase = "Loading packages"; break;
+        case ALPM_PROGRESS_CONFLICTS_START: phase = "Checking conflicts"; break;
+        case ALPM_PROGRESS_DISKSPACE_START: phase = "Checking disk space"; break;
+        default: break;
+    }
+    std::string label = phase ? phase : (pkg && *pkg ? pkg : "Transaction");
+
+    const bool same_bar = (event == current_event && label == current_label);
+    if (same_bar && current_done) return;  // ignore trailing 100% ticks
+    if (!same_bar) {
+        current_event = event;
+        current_label = label;
+        current_done = false;
+    }
+
+    const bool done = percent >= 100;
+    current_done = done;
+    terminal::progress(label, percent, current, total, done);
+}
+
+/// Turn a raw download filename into something readable for the progress line.
+/// Package archives (name-ver-rel-arch.pkg.tar.zst[.sig]) collapse to just the
+/// package name plus a "(sig)" marker; database files (foo.db[.sig]) are left
+/// alone since they are already short and recognisable.
+static std::string download_display_name(const std::string& filename) {
+    std::string name = filename;
+    bool is_signature = false;
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".sig") == 0) {
+        is_signature = true;
+        name.resize(name.size() - 4);
+    }
+    const auto pkg = name.find(".pkg.tar");
+    if (pkg == std::string::npos) return filename;  // database files: leave as-is
+    name.resize(pkg);
+    // Drop the trailing pkgver-pkgrel-arch fields (none may contain '-').
+    for (int i = 0; i < 3; ++i) {
+        const auto dash = name.rfind('-');
+        if (dash == std::string::npos) break;
+        name.resize(dash);
+    }
+    if (is_signature) name += " (sig)";
+    return name;
+}
+
+static void download_callback(void*, const char* filename,
+                              alpm_download_event_type_t event, void* data) {
+    const std::string raw = filename ? filename : "database";
+    const std::string display = download_display_name(raw);
+    const char* name = display.c_str();
+    const bool is_signature = raw.size() >= 4 &&
+        raw.compare(raw.size() - 4, 4, ".sig") == 0;
+    switch (event) {
+        case ALPM_DOWNLOAD_INIT:
+            terminal::progress(name, 0);
+            break;
+        case ALPM_DOWNLOAD_PROGRESS: {
+            const auto* progress = static_cast<alpm_download_event_progress_t*>(data);
+            if (progress && progress->total > 0) {
+                const auto percent = static_cast<int>(100 * progress->downloaded / progress->total);
+                terminal::progress(name, percent);
+            }
+            break;
+        }
+        case ALPM_DOWNLOAD_RETRY:
+            terminal::warning(std::string("Retrying ") + name + " with another mirror");
+            break;
+        case ALPM_DOWNLOAD_COMPLETED: {
+            const auto* completed = static_cast<alpm_download_event_completed_t*>(data);
+            const bool current = completed && completed->result == 1;
+            const bool failed = completed && completed->result < 0;
+            if (failed && is_signature) {
+                // Repositories that don't sign their databases (the official Arch
+                // repos, with the default DatabaseOptional policy) return 404 for
+                // the detached signature. libalpm keeps the database when the
+                // signature is optional; a genuinely required signature failure
+                // aborts alpm_db_update and surfaces as a thrown error instead.
+                terminal::progress(name, 100, 0, 0, true, "no signature");
+                break;
+            }
+            terminal::progress(name, failed ? 0 : 100, 0, 0, true,
+                               failed ? "failed" : (current ? "up to date" : "downloaded"));
+            break;
+        }
+    }
+}
+
+struct Transaction {
+    explicit Transaction(int flags, bool no_confirm) {
+        require_root();
+        g_no_confirm = no_confirm;
+        if (alpm_trans_init(g_handle, flags) < 0) throw alpm_error(last_error("cannot start transaction"));
+    }
+    ~Transaction() { alpm_trans_release(g_handle); g_no_confirm = false; }
+    Transaction(const Transaction&) = delete;
+    Transaction& operator=(const Transaction&) = delete;
+};
+
+static int commit_transaction() {
+    if (!alpm_trans_get_add(g_handle) && !alpm_trans_get_remove(g_handle)) {
+        terminal::success("System packages are already current");
+        return 0;
+    }
+
+    alpm_list_t* data = nullptr;
+    if (alpm_trans_prepare(g_handle, &data) < 0)
+        throw alpm_error(last_error("cannot prepare transaction"));
+    if (!g_no_confirm) {
+        std::cout << "\nPackages to install or upgrade:\n";
+        for (auto* item = alpm_trans_get_add(g_handle); item; item = item->next) {
+            auto* pkg = static_cast<alpm_pkg_t*>(item->data);
+            std::cout << "  " << alpm_pkg_get_name(pkg) << " " << alpm_pkg_get_version(pkg) << "\n";
+        }
+        if (alpm_trans_get_remove(g_handle)) std::cout << "Packages to remove:\n";
+        for (auto* item = alpm_trans_get_remove(g_handle); item; item = item->next) {
+            auto* pkg = static_cast<alpm_pkg_t*>(item->data);
+            std::cout << "  " << alpm_pkg_get_name(pkg) << " " << alpm_pkg_get_version(pkg) << "\n";
+        }
+        if (!isatty(STDIN_FILENO)) {
+            alpm_list_free(data);
+            throw alpm_error("confirmation requires a terminal; use --noconfirm for unattended operation");
+        }
+        std::cout << "\nProceed with transaction? [Y/n] " << std::flush;
+        std::string answer;
+        std::getline(std::cin, answer);
+        if (!answer.empty() && (answer[0] == 'n' || answer[0] == 'N')) {
+            alpm_list_free(data);
+            throw alpm_error("transaction cancelled");
+        }
+    }
+    if (alpm_trans_commit(g_handle, &data) < 0) {
+        alpm_list_free(data);
+        throw alpm_error(last_error("cannot commit transaction"));
+    }
+    alpm_list_free(data);
+    return 0;
+}
 
 // ─── Internal helpers ────────────────────────────────────────────────
 
@@ -25,6 +246,13 @@ static std::vector<std::string> list_to_strings(alpm_list_t* list) {
             result.emplace_back(static_cast<char*>(it->data));
         }
     }
+    return result;
+}
+
+static std::vector<std::string> owned_list_to_strings(alpm_list_t* list) {
+    auto result = list_to_strings(list);
+    alpm_list_free_inner(list, free);
+    alpm_list_free(list);
     return result;
 }
 
@@ -47,6 +275,90 @@ static std::vector<std::string> deps_to_strings(alpm_list_t* list) {
 static std::string dep_to_string(const alpm_depend_t* dep) {
     if (!dep || !dep->name) return {};
     return dep->name;
+}
+
+static std::string trim(std::string value) {
+    auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+static int signature_level(const std::vector<std::string>& values, int inherited = 0) {
+    int level = inherited;
+    constexpr int package_bits = ALPM_SIG_PACKAGE | ALPM_SIG_PACKAGE_OPTIONAL |
+        ALPM_SIG_PACKAGE_MARGINAL_OK | ALPM_SIG_PACKAGE_UNKNOWN_OK;
+    constexpr int database_bits = ALPM_SIG_DATABASE | ALPM_SIG_DATABASE_OPTIONAL |
+        ALPM_SIG_DATABASE_MARGINAL_OK | ALPM_SIG_DATABASE_UNKNOWN_OK;
+    for (const auto& value : values) {
+        if (value == "Never") level &= ~(package_bits | database_bits);
+        else if (value == "Optional") level |= ALPM_SIG_PACKAGE | ALPM_SIG_PACKAGE_OPTIONAL |
+                                                  ALPM_SIG_DATABASE | ALPM_SIG_DATABASE_OPTIONAL;
+        else if (value == "Required") {
+            level |= ALPM_SIG_PACKAGE | ALPM_SIG_DATABASE;
+            level &= ~(ALPM_SIG_PACKAGE_OPTIONAL | ALPM_SIG_DATABASE_OPTIONAL);
+        }
+        else if (value == "TrustedOnly") level &= ~(ALPM_SIG_PACKAGE_MARGINAL_OK | ALPM_SIG_PACKAGE_UNKNOWN_OK |
+                                                       ALPM_SIG_DATABASE_MARGINAL_OK | ALPM_SIG_DATABASE_UNKNOWN_OK);
+        else if (value == "TrustAll") level |= ALPM_SIG_PACKAGE_MARGINAL_OK | ALPM_SIG_PACKAGE_UNKNOWN_OK |
+                                                   ALPM_SIG_DATABASE_MARGINAL_OK | ALPM_SIG_DATABASE_UNKNOWN_OK;
+        else if (value == "PackageNever") level &= ~package_bits;
+        else if (value == "PackageOptional") level |= ALPM_SIG_PACKAGE | ALPM_SIG_PACKAGE_OPTIONAL;
+        else if (value == "PackageRequired") { level |= ALPM_SIG_PACKAGE; level &= ~ALPM_SIG_PACKAGE_OPTIONAL; }
+        else if (value == "PackageTrustedOnly") level &= ~(ALPM_SIG_PACKAGE_MARGINAL_OK | ALPM_SIG_PACKAGE_UNKNOWN_OK);
+        else if (value == "PackageTrustAll") level |= ALPM_SIG_PACKAGE_MARGINAL_OK | ALPM_SIG_PACKAGE_UNKNOWN_OK;
+        else if (value == "DatabaseNever") level &= ~database_bits;
+        else if (value == "DatabaseOptional") level |= ALPM_SIG_DATABASE | ALPM_SIG_DATABASE_OPTIONAL;
+        else if (value == "DatabaseRequired") { level |= ALPM_SIG_DATABASE; level &= ~ALPM_SIG_DATABASE_OPTIONAL; }
+        else if (value == "DatabaseTrustedOnly") level &= ~(ALPM_SIG_DATABASE_MARGINAL_OK | ALPM_SIG_DATABASE_UNKNOWN_OK);
+        else if (value == "DatabaseTrustAll") level |= ALPM_SIG_DATABASE_MARGINAL_OK | ALPM_SIG_DATABASE_UNKNOWN_OK;
+    }
+    return level;
+}
+
+static int repository_usage(const std::vector<std::string>& values) {
+    int usage = 0;
+    for (const auto& value : values) {
+        if (value == "All") usage |= ALPM_DB_USAGE_ALL;
+        else if (value == "Sync") usage |= ALPM_DB_USAGE_SYNC;
+        else if (value == "Search") usage |= ALPM_DB_USAGE_SEARCH;
+        else if (value == "Install") usage |= ALPM_DB_USAGE_INSTALL;
+        else if (value == "Upgrade") usage |= ALPM_DB_USAGE_UPGRADE;
+    }
+    return usage;
+}
+
+static void add_servers_from_file(alpm_db_t* db, const std::string& path,
+                                  const std::string& repository,
+                                  const std::string& architecture,
+                                  bool sectioned) {
+    std::ifstream input(path);
+    std::string line, section;
+    while (std::getline(input, line)) {
+        auto comment = line.find('#');
+        if (comment != std::string::npos) line.erase(comment);
+        line = trim(line);
+        if (line.empty()) continue;
+        if (line.front() == '[' && line.back() == ']') {
+            section = trim(line.substr(1, line.size() - 2));
+            continue;
+        }
+        if (sectioned && section != repository) continue;
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        auto key = trim(line.substr(0, eq));
+        auto value = trim(line.substr(eq + 1));
+        if (key == "Include") {
+            add_servers_from_file(db, value, repository, architecture, false);
+        } else if (key == "Server") {
+            for (auto at = value.find("$repo"); at != std::string::npos; at = value.find("$repo"))
+                value.replace(at, 5, repository);
+            for (auto at = value.find("$arch"); at != std::string::npos; at = value.find("$arch"))
+                value.replace(at, 5, architecture);
+            if (alpm_db_add_server(db, value.c_str()) < 0)
+                throw alpm_error(last_error("cannot add repository server"));
+        }
+    }
 }
 
 static Package pkg_from_alpm(alpm_pkg_t* p, const std::string& origin_db = {}) {
@@ -77,14 +389,52 @@ static Package pkg_from_alpm(alpm_pkg_t* p, const std::string& origin_db = {}) {
     pkg.conflicts      = deps_to_strings(alpm_pkg_get_conflicts(p));
     pkg.provides       = deps_to_strings(alpm_pkg_get_provides(p));
     pkg.replaces       = deps_to_strings(alpm_pkg_get_replaces(p));
+    pkg.required_by    = owned_list_to_strings(alpm_pkg_compute_requiredby(p));
+    pkg.optional_for   = owned_list_to_strings(alpm_pkg_compute_optionalfor(p));
+
+    for (alpm_list_t* it = alpm_pkg_get_backup(p); it; it = it->next) {
+        auto* entry = static_cast<alpm_backup_t*>(it->data);
+        if (entry && entry->name) pkg.backup.emplace_back(entry->name);
+    }
 
     return pkg;
 }
 
+/// Ask a yes/no question on the terminal unless confirmations are suppressed.
+static bool confirm(const std::string& question, bool no_confirm) {
+    if (no_confirm) return true;
+    if (!isatty(STDIN_FILENO))
+        throw alpm_error(question + " (requires a terminal; pass --noconfirm)");
+    std::cout << question << " [Y/n] " << std::flush;
+    std::string answer;
+    std::getline(std::cin, answer);
+    return answer.empty() || (answer[0] != 'n' && answer[0] != 'N');
+}
+
 static void log_callback(void* ctx, alpm_loglevel_t level, const char* fmt, va_list args) {
-    (void)ctx; (void)level;
+    (void)ctx;
+    if (!fmt) return;
+
+    va_list length_args;
+    va_copy(length_args, args);
+    const int length = std::vsnprintf(nullptr, 0, fmt, length_args);
+    va_end(length_args);
+    if (length < 0) return;
+
+    std::vector<char> buffer(static_cast<std::size_t>(length) + 1);
+    va_list format_args;
+    va_copy(format_args, args);
+    std::vsnprintf(buffer.data(), buffer.size(), fmt, format_args);
+    va_end(format_args);
+
+    std::string message(buffer.data(), static_cast<std::size_t>(length));
+    while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
+        message.pop_back();
+
     if (g_log_cb) {
-        g_log_cb(static_cast<int>(level), fmt);
+        g_log_cb(static_cast<int>(level), message.c_str());
+    } else if ((level & ALPM_LOG_WARNING) && !message.empty()) {
+        emit_warning_once(message);
     }
 }
 
@@ -112,28 +462,437 @@ std::optional<Package> get_sync_package(const std::string& name) {
 
 // ─── Public API ──────────────────────────────────────────────────────
 
-void init(const std::string& root, const std::string& db_path) {
+bool uses_system_root() {
+    const char* root = g_handle ? alpm_option_get_root(g_handle) : nullptr;
+    return root && std::string(root) == "/";
+}
+
+/// Detect which x86_64 microarchitectures the CPU supports by reading
+/// /proc/cpuinfo and checking for the instruction-set flags that define
+/// each level (v2, v3, v4).  Returns them in **descending** priority order
+/// so libalpm tries the most specific architecture first — avoiding
+/// redundant retries when a repo only serves a microarch variant.
+static std::vector<std::string> detect_cpu_microarchitectures() {
+    std::vector<std::string> result;
+    std::ifstream cpuinfo("/proc/cpuinfo");
+    if (!cpuinfo.is_open()) return result;
+
+    std::string line, flags_str;
+    while (std::getline(cpuinfo, line)) {
+        if (line.rfind("flags", 0) == 0) {
+            auto eq = line.find(':');
+            if (eq != std::string::npos)
+                flags_str += ' ' + trim(line.substr(eq + 1));
+        }
+    }
+
+    auto has_flag = [&](const std::string& flag) {
+        return flags_str.find(' ' + flag + ' ') != std::string::npos;
+    };
+
+    // x86_64_v2: sse2, cx16, rdtscp
+    bool v2 = has_flag("sse2") && has_flag("cx16") && has_flag("rdtscp");
+    // x86_64_v3: bmi1/bmi2, lzcnt, movbe, f16c, fma, adx
+    bool v3 = v2 && has_flag("bmi1") && has_flag("bmi2") &&
+              has_flag("lzcnt") && has_flag("movbe") &&
+              has_flag("f16c") && has_flag("fma") && has_flag("adx");
+    // x86_64_v4: avx512f + subset of v3
+    bool v4 = v3 && has_flag("avx512f") && has_flag("avx512bw") &&
+              has_flag("avx512cd") && has_flag("avx512dq") &&
+              has_flag("avx512vl");
+
+    // Return descending so the most specific is tried first.
+    if (v4) result.push_back("x86_64_v4");
+    if (v3) result.push_back("x86_64_v3");
+    if (v2) result.push_back("x86_64_v2");
+    return result;
+}
+
+void init(const std::string& root, const std::string& db_path, const std::string& requested_config) {
     if (g_handle) return;
-    g_handle = alpm_initialize(root.c_str(), db_path.c_str(), nullptr);
+    const std::string config_path = requested_config.empty()
+        ? (root == "/" ? "/etc/pacman.conf" : root + "/etc/pacman.conf")
+        : requested_config;
+    std::ifstream config_input(config_path);
+    const auto config = pacman_config::parse(config_input);
+    const auto& options = config.options;
+    g_hold_packages = options.hold_packages;
+    const std::string effective_root = root == "/" ? options.root_dir : root;
+    const std::string effective_db_path = db_path == "/var/lib/pacman/" ? options.db_path : db_path;
+    g_handle = alpm_initialize(effective_root.c_str(), effective_db_path.c_str(), nullptr);
     if (!g_handle) throw alpm_error("Failed to initialize libalpm");
     alpm_option_set_logcb(g_handle, log_callback, nullptr);
-    std::ifstream pacman_conf(root == "/" ? "/etc/pacman.conf"
-                                            : root + "/etc/pacman.conf");
-    auto repositories = pacman_config::repository_names(pacman_conf);
-    if (repositories.empty()) {
-        repositories = {"core", "extra", "multilib"};
+    alpm_option_set_questioncb(g_handle, question_callback, nullptr);
+    alpm_option_set_progresscb(g_handle, progress_callback, nullptr);
+    alpm_option_set_dlcb(g_handle, download_callback, nullptr);
+    for (const auto& path : options.cache_dirs) alpm_option_add_cachedir(g_handle, path.c_str());
+    for (const auto& path : options.hook_dirs) alpm_option_add_hookdir(g_handle, path.c_str());
+    alpm_option_set_gpgdir(g_handle, options.gpg_dir.c_str());
+    alpm_option_set_logfile(g_handle, options.log_file.c_str());
+    if (!options.download_user.empty()) alpm_option_set_sandboxuser(g_handle, options.download_user.c_str());
+    alpm_option_set_parallel_downloads(g_handle, options.parallel_downloads);
+    alpm_option_set_checkspace(g_handle, options.check_space ? 1 : 0);
+    for (const auto& value : options.ignore_packages) alpm_option_add_ignorepkg(g_handle, value.c_str());
+    for (const auto& value : options.ignore_groups) alpm_option_add_ignoregroup(g_handle, value.c_str());
+    for (const auto& value : options.no_upgrade) alpm_option_add_noupgrade(g_handle, value.c_str());
+    for (const auto& value : options.no_extract) alpm_option_add_noextract(g_handle, value.c_str());
+    struct utsname system_info{};
+    const std::string detected_arch = uname(&system_info) == 0 ? system_info.machine : "x86_64";
+
+    // Parse Architecture and keep all supported targets (for example, x86_64
+    // plus x86_64_v2/x86_64_v3 on a capable host).
+    std::string arch_value = options.architecture;
+    // Strip leading/trailing whitespace (already done in parser, but be safe)
+    auto first = arch_value.find_first_not_of(" \t");
+    if (first != std::string::npos) arch_value = arch_value.substr(first);
+    auto last = arch_value.find_last_not_of(" \t");
+    if (last != std::string::npos) arch_value = arch_value.substr(0, last + 1);
+
+    // Strip brackets: [x86_64] -> x86_64 or [auto, x86_64] -> auto, x86_64
+    if (arch_value.size() >= 2 && arch_value.front() == '[' && arch_value.back() == ']') {
+        arch_value = arch_value.substr(1, arch_value.size() - 2);
     }
+
+    auto trim_check = [](std::string s) -> std::string {
+        auto f = s.find_first_not_of(" \t,");
+        if (f != std::string::npos) s = s.substr(f);
+        auto l = s.find_last_not_of(" \t,");
+        if (l != std::string::npos) s = s.substr(0, l + 1);
+        return s;
+    };
+
+    std::vector<std::string> architectures;
+    const auto normalized_arch = trim_check(arch_value);
+    if (normalized_arch.empty() || normalized_arch == "auto" ||
+        normalized_arch.find("auto") != std::string::npos) {
+        for (auto* item = alpm_option_get_physical_architectures(g_handle);
+             item; item = item->next) {
+            if (item->data) architectures.emplace_back(static_cast<char*>(item->data));
+        }
+        if (architectures.empty()) architectures.push_back(detected_arch);
+    } else {
+        std::istringstream values(normalized_arch);
+        for (std::string architecture; values >> architecture;) {
+            if (!architecture.empty() && architecture.back() == ',') architecture.pop_back();
+            if (!architecture.empty()) architectures.push_back(std::move(architecture));
+        }
+    }
+
+    // The $arch variable in mirror URLs is the base machine architecture, never
+    // a microarchitecture level.  pacman substitutes it with the first configured
+    // architecture (uname's machine when Architecture = auto); CachyOS mirrorlists
+    // append the level as literal text ("$arch_v3") and Arch mirrors use
+    // "$repo/os/$arch", so substituting "x86_64_v3" here yields "x86_64_v3_v3" and
+    // ".../os/x86_64_v3" respectively — both 404.  Capture it before the
+    // microarchitecture entries are prepended below.
+    const std::string url_architecture =
+        architectures.empty() ? detected_arch : architectures.front();
+
+    // When the configured architecture is x86_64 (or auto resolved to it),
+    // also register any supported microarchitectures so libalpm can match
+    // packages built for CachyOS v3/v4, Archcraft, etc.
+    // Prepend in reverse order so the final list is descending-priority:
+    // [v4, v3, v2, x86_64].  libalpm tries architectures sequentially per
+    // package lookup — highest first avoids redundant retries on repos that
+    // only serve a microarch variant.
+    if (!architectures.empty() && architectures.front() == "x86_64") {
+        auto detected = detect_cpu_microarchitectures();
+        for (auto it = detected.rbegin(); it != detected.rend(); ++it) {
+            if (std::find(architectures.begin(), architectures.end(), *it)
+                == architectures.end())
+                architectures.insert(architectures.begin(), *it);
+        }
+    }
+    for (const auto& architecture : architectures) {
+        if (alpm_option_add_architecture(g_handle, architecture.c_str()) < 0)
+            throw alpm_error(last_error("cannot set package architecture"));
+    }
+    const std::string& architecture = url_architecture;
+    const int default_siglevel = signature_level(options.sig_level);
+    alpm_option_set_default_siglevel(g_handle, default_siglevel);
+    alpm_option_set_local_file_siglevel(g_handle, options.local_file_sig_level.empty()
+        ? default_siglevel : signature_level(options.local_file_sig_level));
+    alpm_option_set_remote_file_siglevel(g_handle, options.remote_file_sig_level.empty()
+        ? default_siglevel : signature_level(options.remote_file_sig_level));
+    auto repositories = config.repositories;
+    if (repositories.empty()) repositories = {{"core"}, {"extra"}, {"multilib"}};
     for (const auto& repository : repositories) {
-        alpm_register_syncdb(g_handle, repository.c_str(), ALPM_DB_USAGE_ALL);
+        const int siglevel = repository.sig_level.empty()
+            ? ALPM_SIG_USE_DEFAULT : signature_level(repository.sig_level, default_siglevel);
+        auto* db = alpm_register_syncdb(g_handle, repository.name.c_str(), siglevel);
+        if (!db) throw alpm_error(last_error("cannot register repository " + repository.name));
+        if (alpm_db_set_usage(db, repository_usage(repository.usage)) < 0)
+            throw alpm_error(last_error("cannot set repository usage for " + repository.name));
+        add_servers_from_file(db, config_path, repository.name, architecture, true);
     }
 }
 
 void shutdown() {
     if (g_handle) { alpm_release(g_handle); g_handle = nullptr; }
+    g_hold_packages.clear();
 }
 
 void set_log_callback(std::function<void(int, const char*)> cb) {
     g_log_cb = std::move(cb);
+}
+
+int refresh_databases(bool force) {
+    require_root();
+    auto* databases = alpm_get_syncdbs(g_handle);
+    if (!databases) return 0;
+
+    for (auto* item = databases; item; item = item->next) {
+        auto* db = static_cast<alpm_db_t*>(item->data);
+        const char* name = db ? alpm_db_get_name(db) : nullptr;
+        terminal::info(std::string("Synchronizing ") + (name ? name : "repository"));
+    }
+
+    // Submit every sync database in one operation. libalpm schedules their
+    // transfers concurrently up to the pacman.conf ParallelDownloads limit.
+    // Calling alpm_db_update once per database serializes those transfers.
+    if (alpm_db_update(g_handle, databases, force ? 1 : 0) < 0) {
+        throw alpm_error(last_error("failed to synchronize package databases"));
+    }
+    return 0;
+}
+
+static void apply_transaction_options(const std::vector<std::string>& ignore,
+                                      const std::vector<std::string>& ignore_groups,
+                                      const std::vector<std::string>& overwrite) {
+    for (const auto& value : ignore) alpm_option_add_ignorepkg(g_handle, value.c_str());
+    for (const auto& value : ignore_groups) alpm_option_add_ignoregroup(g_handle, value.c_str());
+    for (const auto& value : overwrite) alpm_option_add_overwrite_file(g_handle, value.c_str());
+}
+
+static void warn_about_newer_local_packages() {
+    auto* localdb = alpm_get_localdb(g_handle);
+    if (!localdb) return;
+
+    for (auto* local_item = alpm_db_get_pkgcache(localdb);
+         local_item; local_item = local_item->next) {
+        auto* local_pkg = static_cast<alpm_pkg_t*>(local_item->data);
+        const char* name = local_pkg ? alpm_pkg_get_name(local_pkg) : nullptr;
+        const char* local_version = local_pkg ? alpm_pkg_get_version(local_pkg) : nullptr;
+        if (!name || !local_version) continue;
+
+        for (auto* db_item = alpm_get_syncdbs(g_handle); db_item; db_item = db_item->next) {
+            auto* db = static_cast<alpm_db_t*>(db_item->data);
+            int usage = 0;
+            if (!db || alpm_db_get_usage(db, &usage) < 0 ||
+                !(usage & ALPM_DB_USAGE_UPGRADE)) continue;
+
+            auto* sync_pkg = alpm_db_get_pkg(db, name);
+            if (!sync_pkg) continue;
+            const char* sync_version = alpm_pkg_get_version(sync_pkg);
+            const char* repository = alpm_db_get_name(db);
+            if (sync_version && repository &&
+                alpm_pkg_vercmp(local_version, sync_version) > 0) {
+                emit_warning_once(std::string(name) + ": local (" + local_version +
+                    ") is newer than " + repository + " (" + sync_version + ")");
+            }
+            break; // Repository priority selects the first upgrade-enabled match.
+        }
+    }
+}
+
+int install(const std::vector<std::string>& packages, bool needed, bool no_confirm,
+            const std::vector<std::string>& ignore,
+            const std::vector<std::string>& ignore_groups,
+            const std::vector<std::string>& overwrite) {
+    apply_transaction_options(ignore, ignore_groups, overwrite);
+    Transaction tx(needed ? ALPM_TRANS_FLAG_NEEDED : 0, no_confirm);
+    for (const auto& name : packages) {
+        alpm_pkg_t* found = nullptr;
+        for (auto* it = alpm_get_syncdbs(g_handle); it && !found; it = it->next)
+            found = alpm_db_get_pkg(static_cast<alpm_db_t*>(it->data), name.c_str());
+        if (!found) throw alpm_error("repository package not found: " + name);
+        if (alpm_add_pkg(g_handle, found) < 0) throw alpm_error(last_error("cannot add " + name));
+    }
+    return commit_transaction();
+}
+
+int system_upgrade(bool allow_downgrade, bool no_confirm,
+                   const std::vector<std::string>& ignore,
+                   const std::vector<std::string>& ignore_groups,
+                   const std::vector<std::string>& overwrite) {
+    apply_transaction_options(ignore, ignore_groups, overwrite);
+    Transaction tx(0, no_confirm);
+    clear_emitted_warnings();
+    warn_about_newer_local_packages();
+    if (alpm_sync_sysupgrade(g_handle, allow_downgrade ? 1 : 0) < 0)
+        throw alpm_error(last_error("cannot calculate system upgrade"));
+    return commit_transaction();
+}
+
+int remove(const std::vector<std::string>& packages, bool recurse, bool cascade,
+           bool no_save, bool no_confirm, bool recurse_all, bool nodeps) {
+    int flags = (recurse ? ALPM_TRANS_FLAG_RECURSE : 0) |
+                (cascade ? ALPM_TRANS_FLAG_CASCADE : 0) |
+                (no_save ? ALPM_TRANS_FLAG_NOSAVE : 0) |
+                (recurse_all ? ALPM_TRANS_FLAG_RECURSEALL : 0) |
+                (nodeps ? ALPM_TRANS_FLAG_NODEPS : 0);
+    Transaction tx(flags, no_confirm);
+    auto* local = alpm_get_localdb(g_handle);
+    for (const auto& name : packages) {
+        if (std::find(g_hold_packages.begin(), g_hold_packages.end(), name) != g_hold_packages.end())
+            throw alpm_error("refusing to remove HoldPkg package: " + name);
+        auto* pkg = alpm_db_get_pkg(local, name.c_str());
+        if (!pkg) throw alpm_error("installed package not found: " + name);
+        if (alpm_remove_pkg(g_handle, pkg) < 0) throw alpm_error(last_error("cannot remove " + name));
+    }
+    return commit_transaction();
+}
+
+int download(const std::vector<std::string>& packages, bool sysupgrade, bool no_confirm,
+             const std::vector<std::string>& ignore,
+             const std::vector<std::string>& ignore_groups) {
+    apply_transaction_options(ignore, ignore_groups, {});
+    Transaction tx(ALPM_TRANS_FLAG_DOWNLOADONLY, no_confirm);
+    if (sysupgrade && alpm_sync_sysupgrade(g_handle, 0) < 0)
+        throw alpm_error(last_error("cannot calculate system upgrade"));
+    for (const auto& name : packages) {
+        alpm_pkg_t* found = nullptr;
+        for (auto* it = alpm_get_syncdbs(g_handle); it && !found; it = it->next)
+            found = alpm_db_get_pkg(static_cast<alpm_db_t*>(it->data), name.c_str());
+        if (!found) throw alpm_error("repository package not found: " + name);
+        if (alpm_add_pkg(g_handle, found) < 0) throw alpm_error(last_error("cannot add " + name));
+    }
+    return commit_transaction();
+}
+
+int install_files(const std::vector<std::string>& paths, bool no_confirm) {
+    Transaction tx(0, no_confirm);
+
+    // Split remote URLs from local paths and download the former into the cache.
+    std::vector<std::string> local_paths;
+    alpm_list_t* urls = nullptr;
+    for (const auto& path : paths) {
+        if (path.find("://") != std::string::npos)
+            urls = alpm_list_add(urls, strdup(path.c_str()));
+        else
+            local_paths.push_back(path);
+    }
+    if (urls) {
+        alpm_list_t* fetched = nullptr;
+        const int rc = alpm_fetch_pkgurl(g_handle, urls, &fetched);
+        alpm_list_free_inner(urls, free);
+        alpm_list_free(urls);
+        if (rc != 0) {
+            alpm_list_free(fetched);
+            throw alpm_error(last_error("cannot download package URL"));
+        }
+        for (alpm_list_t* it = fetched; it; it = it->next)
+            if (it->data) local_paths.emplace_back(static_cast<char*>(it->data));
+        alpm_list_free_inner(fetched, free);
+        alpm_list_free(fetched);
+    }
+
+    for (const auto& path : local_paths) {
+        alpm_pkg_t* pkg = nullptr;
+        if (alpm_pkg_load(g_handle, path.c_str(), 1, alpm_option_get_local_file_siglevel(g_handle), &pkg) < 0)
+            throw alpm_error(last_error("cannot load package " + path));
+        if (alpm_add_pkg(g_handle, pkg) < 0) throw alpm_error(last_error("cannot add package " + path));
+    }
+    return commit_transaction();
+}
+
+Package load_package_file(const std::string& path) {
+    if (!g_handle) throw alpm_error("libalpm not initialized");
+    alpm_pkg_t* pkg = nullptr;
+    if (alpm_pkg_load(g_handle, path.c_str(), 1,
+                      alpm_option_get_local_file_siglevel(g_handle), &pkg) < 0 || !pkg)
+        throw alpm_error(last_error("cannot load package file " + path));
+    Package result = pkg_from_alpm(pkg, "file");
+    if (auto* files = alpm_pkg_get_files(pkg)) {
+        result.files.reserve(files->count);
+        for (std::size_t i = 0; i < files->count; ++i)
+            if (files->files[i].name) result.files.emplace_back(files->files[i].name);
+    }
+    alpm_pkg_free(pkg);
+    return result;
+}
+
+std::string get_changelog(const std::string& name) {
+    if (!g_handle) throw alpm_error("libalpm not initialized");
+    auto* pkg = alpm_db_get_pkg(alpm_get_localdb(g_handle), name.c_str());
+    if (!pkg) throw alpm_error("installed package not found: " + name);
+    void* stream = alpm_pkg_changelog_open(pkg);
+    if (!stream) return {};
+    std::string out;
+    char buffer[4096];
+    for (size_t read; (read = alpm_pkg_changelog_read(buffer, sizeof(buffer), pkg, stream)) != 0;)
+        out.append(buffer, read);
+    alpm_pkg_changelog_close(pkg, stream);
+    return out;
+}
+
+CacheCleanResult clean_cache(bool all, bool no_confirm) {
+    if (!g_handle) throw alpm_error("libalpm not initialized");
+    require_root();
+    namespace fs = std::filesystem;
+    auto* localdb = alpm_get_localdb(g_handle);
+    CacheCleanResult result{};
+
+    for (auto* it = alpm_option_get_cachedirs(g_handle); it; it = it->next) {
+        const auto* raw = static_cast<const char*>(it->data);
+        if (!raw) continue;
+        const fs::path dir(raw);
+        std::error_code ec;
+        if (!fs::is_directory(dir, ec)) continue;
+        if (!confirm((all ? "Remove all files from " : "Remove unused packages from ")
+                     + dir.string() + "?", no_confirm))
+            continue;
+
+        for (const auto& entry : fs::directory_iterator(dir, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file(ec)) continue;
+            const fs::path file = entry.path();
+
+            bool drop = all;
+            if (!all) {
+                if (file.filename().string().find(".pkg.tar") == std::string::npos) continue;
+                alpm_pkg_t* pkg = nullptr;
+                if (alpm_pkg_load(g_handle, file.c_str(), 0, 0, &pkg) == 0 && pkg) {
+                    auto* held = alpm_db_get_pkg(localdb, alpm_pkg_get_name(pkg));
+                    drop = !held || alpm_pkg_vercmp(alpm_pkg_get_version(pkg),
+                                                   alpm_pkg_get_version(held)) != 0;
+                    alpm_pkg_free(pkg);
+                } else {
+                    drop = false;  // unreadable archive — leave it in place
+                }
+            }
+            if (!drop) continue;
+
+            const auto size = fs::file_size(file, ec);
+            if (fs::remove(file, ec)) {
+                ++result.files_removed;
+                if (!ec) result.bytes_freed += static_cast<unsigned long long>(size);
+            }
+            std::error_code sig_ec;
+            fs::remove(fs::path(file) += ".sig", sig_ec);
+        }
+    }
+
+    if (all) {
+        if (const char* dbpath = alpm_option_get_dbpath(g_handle)) {
+            const fs::path sync = fs::path(dbpath) / "sync";
+            std::error_code ec;
+            if (fs::is_directory(sync, ec) &&
+                confirm("Remove downloaded sync databases from " + sync.string() + "?", no_confirm)) {
+                for (const auto& entry : fs::directory_iterator(sync, ec)) {
+                    if (ec) break;
+                    if (!entry.is_regular_file(ec)) continue;
+                    const auto size = fs::file_size(entry.path(), ec);
+                    if (fs::remove(entry.path(), ec)) {
+                        ++result.files_removed;
+                        if (!ec) result.bytes_freed += static_cast<unsigned long long>(size);
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
 }
 
 std::vector<Package> get_local_packages() {
@@ -149,14 +908,26 @@ std::vector<Package> get_local_packages() {
 }
 
 std::vector<Package> get_foreign_packages() {
-    auto installed = get_local_packages();
-    std::vector<Package> result;
-    result.reserve(installed.size());
+    if (!g_handle) throw alpm_error("libalpm not initialized");
+    alpm_db_t* localdb = alpm_get_localdb(g_handle);
+    if (!localdb) throw alpm_error("Failed to get local database");
 
-    for (auto& pkg : installed) {
-        if (!get_sync_package(pkg.name)) {
-            result.push_back(std::move(pkg));
+    std::vector<Package> result;
+    for (alpm_list_t* item = alpm_db_get_pkgcache(localdb); item; item = item->next) {
+        auto* pkg = static_cast<alpm_pkg_t*>(item->data);
+        const char* name = pkg ? alpm_pkg_get_name(pkg) : nullptr;
+        if (!name) continue;
+
+        bool found_in_sync = false;
+        for (alpm_list_t* db_item = alpm_get_syncdbs(g_handle);
+             db_item; db_item = db_item->next) {
+            auto* db = static_cast<alpm_db_t*>(db_item->data);
+            if (db && alpm_db_get_pkg(db, name)) {
+                found_in_sync = true;
+                break;
+            }
         }
+        if (!found_in_sync) result.push_back(pkg_from_alpm(pkg, "local"));
     }
 
     std::sort(result.begin(), result.end(),
@@ -229,9 +1000,85 @@ std::vector<RepoPkg> list_sync_packages() {
 
 std::vector<std::string> list_package_files(const std::string& name) {
     if (!g_handle) throw alpm_error("libalpm not initialized");
-    auto pkg = get_local_package(name);
+    auto* pkg = alpm_db_get_pkg(alpm_get_localdb(g_handle), name.c_str());
     if (!pkg) return {};
-    return {}; // File iteration requires alpm_filelist_t — simplified
+    auto* files = alpm_pkg_get_files(pkg);
+    std::vector<std::string> result;
+    if (!files) return result;
+    result.reserve(files->count);
+    for (std::size_t i = 0; i < files->count; ++i)
+        if (files->files[i].name) result.emplace_back(files->files[i].name);
+    return result;
+}
+
+std::optional<std::string> find_file_owner(const std::string& path) {
+    if (!g_handle) throw alpm_error("libalpm not initialized");
+    std::string relative = path;
+    while (!relative.empty() && relative.front() == '/') relative.erase(relative.begin());
+    for (auto* item = alpm_db_get_pkgcache(alpm_get_localdb(g_handle)); item; item = item->next) {
+        auto* pkg = static_cast<alpm_pkg_t*>(item->data);
+        if (alpm_filelist_contains(alpm_pkg_get_files(pkg), relative.c_str()))
+            return std::string(alpm_pkg_get_name(pkg));
+    }
+    return std::nullopt;
+}
+
+std::vector<PackageGroup> list_sync_groups() {
+    if (!g_handle) throw alpm_error("libalpm not initialized");
+    std::vector<PackageGroup> result;
+    for (auto* db_item = alpm_get_syncdbs(g_handle); db_item; db_item = db_item->next) {
+        auto* db = static_cast<alpm_db_t*>(db_item->data);
+        for (auto* item = alpm_db_get_groupcache(db); item; item = item->next) {
+            auto* group = static_cast<alpm_group_t*>(item->data);
+            PackageGroup out{alpm_db_get_name(db), group->name, {}};
+            for (auto* pkg_item = group->packages; pkg_item; pkg_item = pkg_item->next)
+                out.packages.emplace_back(alpm_pkg_get_name(static_cast<alpm_pkg_t*>(pkg_item->data)));
+            result.push_back(std::move(out));
+        }
+    }
+    return result;
+}
+
+std::vector<FileMatch> search_sync_files(const std::string& query) {
+    if (!g_handle) throw alpm_error("libalpm not initialized");
+    std::vector<FileMatch> result;
+    for (auto* db_item = alpm_get_syncdbs(g_handle); db_item; db_item = db_item->next) {
+        auto* db = static_cast<alpm_db_t*>(db_item->data);
+        if (!db) continue;
+        for (auto* pkg_item = alpm_db_get_pkgcache(db); pkg_item; pkg_item = pkg_item->next) {
+            auto* pkg = static_cast<alpm_pkg_t*>(pkg_item->data);
+            const auto* files = pkg ? alpm_pkg_get_files(pkg) : nullptr;
+            if (!files) continue;
+            for (size_t i = 0; i < files->count; ++i) {
+                const char* name = files->files[i].name;
+                if (name && std::string(name).find(query) != std::string::npos)
+                    result.push_back({alpm_db_get_name(db), alpm_pkg_get_name(pkg), name});
+            }
+        }
+    }
+    return result;
+}
+
+std::vector<std::string> missing_dependencies(const std::vector<std::string>& dependencies) {
+    if (!g_handle) throw alpm_error("libalpm not initialized");
+    std::vector<std::string> missing;
+    auto* packages = alpm_db_get_pkgcache(alpm_get_localdb(g_handle));
+    for (const auto& dependency : dependencies)
+        if (!alpm_find_satisfier(packages, dependency.c_str())) missing.push_back(dependency);
+    return missing;
+}
+
+int set_install_reason(const std::vector<std::string>& packages, bool explicit_reason) {
+    require_root();
+    auto* local = alpm_get_localdb(g_handle);
+    for (const auto& name : packages) {
+        auto* pkg = alpm_db_get_pkg(local, name.c_str());
+        if (!pkg) throw alpm_error("installed package not found: " + name);
+        const auto reason = explicit_reason ? ALPM_PKG_REASON_EXPLICIT : ALPM_PKG_REASON_DEPEND;
+        if (alpm_pkg_set_reason(pkg, reason) < 0)
+            throw alpm_error(last_error("cannot update install reason for " + name));
+    }
+    return 0;
 }
 
 bool package_exists(const std::string& name) {
@@ -261,31 +1108,8 @@ bool is_orphan(const std::string& name) {
     try {
         auto pkg = get_local_package(name);
         if (!pkg) return false;
-        return pkg->reason == Package::Reason::Dependency;
+        return pkg->reason == Package::Reason::Dependency && pkg->required_by.empty();
     } catch (...) { return false; }
-}
-
-/// Extract package name from a dependency spec (e.g., "pkg>=1.0" -> "pkg").
-static std::string dep_spec_name(const std::string& spec) {
-    for (char sep : {'>', '<', '=', '!'}) {
-        auto pos = spec.find(sep);
-        if (pos != std::string::npos) return spec.substr(0, pos);
-    }
-    return spec;
-}
-
-/// Check if a package is still required by any explicitly installed or retained package.
-static bool is_still_needed(const std::string& name, const std::vector<Package>& all_pkgs) {
-    // Build reverse dependency map: for each package, collect what it depends on
-    for (auto& pkg : all_pkgs) {
-        if (pkg.reason == Package::Reason::Explicit) {
-            for (auto& dep : pkg.depends) {
-                auto dep_name = dep_spec_name(dep);
-                if (dep_name == name) return true;
-            }
-        }
-    }
-    return false;
 }
 
 std::vector<Package> get_orphan_packages() {
@@ -293,12 +1117,8 @@ std::vector<Package> get_orphan_packages() {
         auto pkgs = get_local_packages();
         std::vector<Package> orphans;
         for (auto& pkg : pkgs) {
-            if (pkg.reason == Package::Reason::Dependency) {
-                // Check if still needed by any explicit package
-                if (!is_still_needed(pkg.name, pkgs)) {
-                    orphans.push_back(pkg);
-                }
-            }
+            if (pkg.reason == Package::Reason::Dependency && pkg.required_by.empty())
+                orphans.push_back(pkg);
         }
         return orphans;
     } catch (...) { return {}; }

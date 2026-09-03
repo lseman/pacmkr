@@ -1,8 +1,10 @@
-#include "pacmkr/build.h"
-#include "pacmkr/optimize.h"
-#include "pacmkr/source.h"
-#include "pacmkr/error.h"
-#include "pacmkr/progress.h"
+#include "pacmkr/build/build.h"
+#include "pacmkr/core/optimize.h"
+#include "pacmkr/build/source.h"
+#include "pacmkr/core/error.h"
+#include "pacmkr/core/package.h"
+#include "pacmkr/backend/alpm.h"
+#include "pacmkr/app/terminal.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -11,8 +13,11 @@
 #include <queue>
 #include <sstream>
 #include <thread>
-#include <mutex>
 #include <atomic>
+#include <chrono>
+#include <cerrno>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace pacmkr::build {
 
@@ -22,10 +27,27 @@ bool check_tool(const std::string& name) {
     return optimize::find_tool(name).has_value();
 }
 
+int sign_archive(const std::filesystem::path& archive, const std::optional<std::string>& key) {
+    const pid_t child = fork();
+    if (child < 0) throw package_error("cannot create signing process");
+    if (child == 0) {
+        if (key)
+            execlp("gpg", "gpg", "--batch", "--yes", "--detach-sign", "--local-user",
+                   key->c_str(), archive.c_str(), static_cast<char*>(nullptr));
+        else
+            execlp("gpg", "gpg", "--batch", "--yes", "--detach-sign",
+                   archive.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128;
+}
+
 } // anonymous
 
 void check_requirements() {
-    static const char* tools[] = {"bash", "fakeroot", "bsdtar", "gzip", "sha256sum"};
+    static const char* tools[] = {"bash", "fakeroot", "bsdtar", "zstd", "sha256sum"};
     for (auto* tool : tools) {
         if (!check_tool(tool)) {
             throw missing_tool_error(tool);
@@ -41,6 +63,8 @@ int BuildOrchestrator::run() {
     auto workdir = std::filesystem::current_path();
     auto srcdir = workdir / "src";
     auto pkgdir = workdir / "pkg";
+
+    terminal::section("Build: " + pkgbuild.pkgbase());
 
     // Clean if requested
     if (cli.cleanbuild && std::filesystem::exists(srcdir)) {
@@ -60,22 +84,56 @@ int BuildOrchestrator::run() {
     // Set up environment with optimization flags
     setup_environment();
 
+    if (!cli.noextract) {
+        source::SourceHandler sources{config.srcdest, cli.skipchecksums || cli.skipinteg};
+        sources.download_and_verify(pkgbuild, srcdir);
+    }
+    if (cli.verifysource || cli.nobuild) return 0;
+
     // Run prepare() if present and not skipped
     if (!cli.noprepare && pkgbuild.has_function("prepare")) {
-        run_function("prepare", srcdir);
+        if (run_function("prepare", srcdir) != 0) return 1;
     }
 
     // Run build() if present
     if (pkgbuild.has_function("build")) {
-        run_function("build", srcdir);
+        if (run_function("build", srcdir) != 0) return 1;
     }
 
     // Run check() if requested
     if ((cli.check || !cli.nocheck) && pkgbuild.has_function("check")) {
-        run_function("check", srcdir);
+        if (run_function("check", srcdir) != 0) return 1;
     }
 
-    std::cout << "==> Build completed successfully.\n";
+    std::vector<std::filesystem::path> archives;
+    const auto destination = std::filesystem::absolute(config.pkgdest);
+    std::filesystem::create_directories(destination);
+    for (const auto& name : pkgbuild.pkgname) {
+        std::filesystem::remove_all(pkgdir);
+        std::filesystem::create_directories(pkgdir);
+        const std::string function = pkgbuild.has_function("package_" + name) ? "package_" + name : "package";
+        if (!pkgbuild.has_function(function)) throw package_error("PKGBUILD has no " + function + "() function");
+        if (run_function(function, srcdir, pkgdir, true) != 0) return 1;
+        const std::string arch = pkgbuild.arch.empty() ? "any" : pkgbuild.arch.front();
+        auto output = package::Package::make(name, pkgbuild.pkgver + "-" + pkgbuild.pkgrel, arch, destination);
+        output.write_pkginfo(pkgbuild, pkgdir, config.packager,
+            static_cast<uint64_t>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())));
+        if (!cli.noarchive) {
+            output.create_archive(pkgdir);
+            if (cli.sign && !cli.nosign && sign_archive(output.dest, cli.key) != 0)
+                throw package_error("failed to sign package archive " + output.dest.string());
+            archives.push_back(output.dest);
+        }
+    }
+
+    if (cli.install) {
+        if (archives.empty()) throw package_error("cannot install when package archive creation is disabled");
+        std::vector<std::string> paths;
+        for (const auto& archive : archives) paths.push_back(archive.string());
+        alpm::install_files(paths, cli.noconfirm);
+    }
+
+    terminal::success("Build completed successfully");
     return 0;
 }
 
@@ -83,18 +141,16 @@ void BuildOrchestrator::setup_environment() {
     auto opt = optimize::OptConfig::from_cli(cli);
     opt.apply_compiler_env();
 
-    auto [cflags, cxxflags, ldflags] = opt.apply_flags();
-
-    // Merge with config defaults if env vars not set
-    if (std::getenv("CFLAGS") == nullptr && !config.cflags.empty()) {
-        setenv("CFLAGS", config.cflags.c_str(), 0);
-    }
-    if (std::getenv("CXXFLAGS") == nullptr && !config.cxxflags.empty()) {
-        setenv("CXXFLAGS", config.cxxflags.c_str(), 0);
-    }
-    if (std::getenv("LDFLAGS") == nullptr && !config.ldflags.empty()) {
-        setenv("LDFLAGS", config.ldflags.c_str(), 0);
-    }
+    auto baseline = [&](char const* name, std::string const& configured) {
+        if (auto const* value = std::getenv(name)) return std::string(value);
+        return configured;
+    };
+    auto [cflags, cxxflags, ldflags] = opt.apply_flags_to(
+        baseline("CFLAGS", config.cflags), baseline("CXXFLAGS", config.cxxflags),
+        baseline("LDFLAGS", config.ldflags));
+    setenv("CFLAGS", cflags.c_str(), 1);
+    setenv("CXXFLAGS", cxxflags.c_str(), 1);
+    setenv("LDFLAGS", ldflags.c_str(), 1);
 
     // Apply --mflags: custom makepkg flags
     if (!cli.mflags.empty()) {
@@ -104,30 +160,55 @@ void BuildOrchestrator::setup_environment() {
             mflags_env << cli.mflags[i];
         }
         setenv("MAKEFLAGS", mflags_env.str().c_str(), 1);
-        std::cout << "==> Makeflags: " << mflags_env.str() << "\n";
+        terminal::info("Makeflags: " + mflags_env.str());
+    } else if (std::getenv("MAKEFLAGS") == nullptr && !config.makeflags.empty()) {
+        auto makeflags = config.makeflags;
+        auto const marker = makeflags.find("$(nproc)");
+        if (marker != std::string::npos)
+            makeflags.replace(marker, 8, std::to_string(std::max(1u, std::thread::hardware_concurrency())));
+        setenv("MAKEFLAGS", makeflags.c_str(), 1);
+        terminal::info("Makeflags: " + makeflags);
     }
 
-    // Print optimization summary
-    std::cout << "==> Compiler: " << (opt.compiler == cli::Compiler::Gcc ? "gcc" : "clang") << "\n";
-    std::cout << "==> Optimizations: " << opt.summary() << "\n";
-    if (!cflags.empty())   std::cout << "==> CFLAGS: " << cflags << "\n";
-    if (!cxxflags.empty()) std::cout << "==> CXXFLAGS: " << cxxflags << "\n";
-    if (!ldflags.empty())  std::cout << "==> LDFLAGS: " << ldflags << "\n";
+    terminal::info("Compiler: " + std::string(opt.compiler == cli::Compiler::Gcc ? "gcc" : "clang"));
+    terminal::info("Optimizations: " + opt.summary());
+    if (!cflags.empty())   terminal::info("CFLAGS: " + cflags);
+    if (!cxxflags.empty()) terminal::info("CXXFLAGS: " + cxxflags);
+    if (!ldflags.empty())  terminal::info("LDFLAGS: " + ldflags);
 }
 
 int BuildOrchestrator::run_function(const std::string& func_name,
-                                     const std::filesystem::path& workdir) {
+                                     const std::filesystem::path& srcdir,
+                                     const std::filesystem::path& pkgdir,
+                                     bool use_fakeroot) {
     if (!pkgbuild.has_function(func_name)) {
         std::cout << "==> No " << func_name << "() function found, skipping.\n";
         return 0;
     }
 
-    std::cout << "==> Starting " << func_name << "()...\n";
+    terminal::info("Running " + func_name + "()");
 
-    std::ostringstream cmd;
-    cmd << "cd '" << workdir.string() << "' && " << func_name << "()";
-
-    int rc = std::system(cmd.str().c_str());
+    const auto script = pkgbuild.source_path.empty()
+        ? std::filesystem::absolute(cli.packagefile.empty() ? "PKGBUILD" : cli.packagefile)
+        : pkgbuild.source_path;
+    const std::string shell = "source \"$1\"; cd \"$2\"; \"$3\"";
+    const pid_t child = fork();
+    if (child < 0) throw package_error("cannot create build process");
+    if (child == 0) {
+        setenv("srcdir", srcdir.c_str(), 1);
+        setenv("startdir", script.parent_path().c_str(), 1);
+        if (!pkgdir.empty()) setenv("pkgdir", pkgdir.c_str(), 1);
+        if (use_fakeroot)
+            execlp("fakeroot", "fakeroot", "--", "bash", "-c", shell.c_str(), "pacmkr",
+                   script.c_str(), srcdir.c_str(), func_name.c_str(), static_cast<char*>(nullptr));
+        else
+            execlp("bash", "bash", "-c", shell.c_str(), "pacmkr", script.c_str(),
+                   srcdir.c_str(), func_name.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    const int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
     if (rc != 0) {
         std::cerr << "==> " << func_name << "() failed.\n";
         return rc;
@@ -144,20 +225,12 @@ std::string BuildOrchestrator::version() const {
 
 int run_parallel_builds(const std::vector<std::string>& package_dirs,
                         const cli::Cli& base_cli, const config::Config& config,
-                        progress::MultiProgress& mp, int max_jobs) {
+                        int max_jobs) {
     if (package_dirs.empty()) return 0;
 
-    // Build list of package names for progress tracking
-    std::vector<std::string> pkg_names;
-    for (auto& dir : package_dirs) {
-        pkg_names.push_back(std::filesystem::path(dir).filename().string());
-        mp.add_package(pkg_names.back());
-    }
-
     std::atomic<int> failures{0};
-    std::mutex mp_mutex; // Protect MultiProgress access
 
-    auto build_single = [&](int pkg_idx, const std::string& dir) {
+    auto build_single = [&](const std::string& dir) {
         try {
             cli::Cli cli = base_cli;
             cli.install = true;
@@ -188,21 +261,7 @@ int run_parallel_builds(const std::vector<std::string>& package_dirs,
                 if (idx >= work_queue.size()) break;
 
                 std::string dir = work_queue[idx];
-                int pkg_idx = static_cast<int>(idx);
-
-                // Update progress bar for this package
-                {
-                    std::lock_guard<std::mutex> lock(mp_mutex);
-                    mp.set_active(pkg_idx);
-                    mp.update(pkg_idx, 0);
-                }
-
-                build_single(pkg_idx, dir);
-
-                {
-                    std::lock_guard<std::mutex> lock(mp_mutex);
-                    mp.complete(pkg_idx);
-                }
+                build_single(dir);
             }
         });
     }

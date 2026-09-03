@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=pacmkr
+GenericName=Package Manager
+Comment=Search, build, and update Arch Linux packages
+Exec=pacmkr-gui
+Icon=com.pacmkr.gui
+Terminal=false
+Categories=System;PackageManager;Settings;
+Keywords=Arch;AUR;pacman;packages;updates;
+StartupNotify=true

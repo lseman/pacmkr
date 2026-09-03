@@ -16,17 +16,17 @@
 ## Why pacmkr?
 
 pacmkr brings official repository and AUR workflows into one C++17 command-line
-tool. Read-only repository operations use libalpm, system mutations are handed
-to pacman, and AUR packages are resolved and built in dependency order.
+tool. Repository reads and system transactions use libalpm directly, and AUR
+packages are resolved and built in dependency order.
 
 - Pacman-style commands, including `-Syu`, `-Ss`, `-Q`, and `-Rns`
-- Atomic repository refresh and upgrade through `pacman -Syu`
+- Atomic native repository refresh and upgrade through libalpm
 - Unified official repository and AUR search
 - Transitive AUR dependency resolution with topological build ordering
 - PKGBUILD parsing, source verification, packaging, and installation
 - Optional LTO, mold, GCC Graphite, and LLVM Polly build optimization
-- Interactive terminal output with multi-package progress
-- Experimental Slint GUI sources
+- Plain-text command output suitable for terminals, logs, and scripts
+- Optional GTK4 desktop dashboard
 
 ## Quick start
 
@@ -44,24 +44,48 @@ ctest --test-dir build --output-on-failure
 sudo cmake --install build
 ```
 
+With [`just`](https://just.systems/), the common build workflow is:
+
+```bash
+just
+just test
+just install
+```
+
+Use `just install-user` to install under `~/.local` without root privileges.
+Build options can be passed through to Make, for example `just build GUI=OFF`
+for a CLI-only build or `just install PREFIX=/usr/local` for a different
+prefix.
+
+The equivalent conventional Make workflow is:
+
+```bash
+make
+make test
+sudo make install
+```
+
+The install includes the `pacmkr` and `pacmkr-repo` command-line tools, GTK
+application, desktop launcher, application metadata, icon, and license.
+
 ## Usage
 
 ```bash
 # Refresh databases and upgrade repository + AUR packages
-pacmkr -Syu
+sudo pacmkr -Syu
 
 # Search official repositories and the AUR
 pacmkr -Ss terminal
 
 # Install a repository package, falling back to the AUR when needed
-pacmkr -S package-name
+sudo pacmkr -S package-name
 
 # Fetch and build an AUR package with its dependencies
 pacmkr --aur --aur-deps package-name
 
 # Inspect foreign packages and remove a package cleanly
 pacmkr -Qm
-pacmkr -Rns package-name
+sudo pacmkr -Rns package-name
 ```
 
 `pacmkr -Qm` (or `pacmkr --list-foreign`) lists every installed package
@@ -73,18 +97,18 @@ Run `pacmkr --help` for the complete option reference.
 ### Local repositories
 
 ```bash
-pacmkr repo create myrepo ~/.local/share/pacmkr/myrepo
-pacmkr repo add myrepo ./package-1.0-1-x86_64.pkg.tar.zst
-pacmkr repo remove myrepo package
-pacmkr repo list
-pacmkr repo delete myrepo
+pacmkr-repo create myrepo ~/.local/share/pacmkr/myrepo
+pacmkr-repo add myrepo ./package-1.0-1-x86_64.pkg.tar.zst
+pacmkr-repo remove myrepo package
+pacmkr-repo list
+pacmkr-repo delete myrepo
 ```
 
 `create` registers the directory; the database is generated when the first
 package is added. `add` copies package archives (and adjacent signatures) into
 the repository before indexing them. `delete` unregisters the repository but
 deliberately preserves its database and package files. Add the generated
-database to `pacman.conf` separately when you want pacman to consume it
+database to `pacman.conf` separately when you want it available system-wide
 system-wide.
 
 ### Build optimization
@@ -118,28 +142,31 @@ polly = false
 ## How it works
 
 ```text
-CLI / TUI
+CLI
     │
     ├── read operations ──► libalpm ──► repository + local databases
-    ├── write operations ─► pacman  ──► privileged system transaction
-    └── AUR operations ───► resolver ─► PKGBUILD ─► package ─► pacman -U
+    ├── write operations ─► libalpm ──► privileged system transaction
+    └── AUR operations ───► resolver ─► PKGBUILD ─► package ─► libalpm
 ```
 
-pacmkr keeps repository upgrades atomic: `pacmkr -Syu` invokes a single
-`pacman -Syu` transaction before resolving out-of-date AUR packages. This
+pacmkr keeps repository upgrades atomic: `sudo pacmkr -Syu` invokes a single
+native libalpm transaction before resolving out-of-date AUR packages. This
 avoids the partial-upgrade window created by splitting refresh and upgrade into
 separate commands.
 
 ## Project layout
 
 ```text
-include/pacmkr/  C++ interfaces
-src/app/         Entry point and application orchestration
-src/backend/     libalpm, pacman, repository, and AUR integration
+include/pacmkr/app/      CLI and terminal interfaces
+include/pacmkr/backend/  Package-manager and AUR interfaces
+include/pacmkr/build/    PKGBUILD and package-construction interfaces
+include/pacmkr/core/     Configuration and shared domain interfaces
+include/pacmkr/gui/      GUI adapter interfaces
+src/app/         Entry point, argument parsing, and application orchestration
+src/backend/     libalpm transactions, repositories, and AUR integration
 src/build/       PKGBUILD parsing and package build pipeline
 src/core/        Configuration, package models, shared infrastructure
-src/tui/         Argument parsing, status output, and progress UI
-src/gui/         Experimental Slint desktop UI
+src/gui/gtk/     GTK4 desktop UI and backend adapter
 tests/           C++ unit and regression tests
 ```
 

@@ -1,5 +1,5 @@
-#include "pacmkr/optimize.h"
-#include "pacmkr/error.h"
+#include "pacmkr/core/optimize.h"
+#include "pacmkr/core/error.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -16,21 +16,8 @@ bool is_enabled(cli::OptMode mode) {
     return mode == cli::OptMode::Enabled;
 }
 
-bool is_disabled(cli::OptMode mode) {
-    return mode == cli::OptMode::Disabled;
-}
-
-bool is_auto(cli::OptMode mode) {
-    return mode == cli::OptMode::Auto;
-}
-
 bool mold_available() {
     return find_tool("mold").has_value();
-}
-
-int cpu_count() {
-    int n = std::thread::hardware_concurrency();
-    return n > 0 ? n : 2;
 }
 
 } // anonymous
@@ -68,21 +55,17 @@ OptConfig OptConfig::from_cli(const cli::Cli& cli) {
         cfg.polly = false;
     } else {
         // Graphite only works with GCC
-        cfg.graphite = user_graphite
-            ? (cfg.compiler == cli::Compiler::Gcc)
-            : (is_auto(cli.graphite) && cfg.compiler == cli::Compiler::Gcc);
+        cfg.graphite = user_graphite && cfg.compiler == cli::Compiler::Gcc;
 
         // Polly only works with Clang
-        cfg.polly = user_polly
-            ? (cfg.compiler == cli::Compiler::Clang)
-            : (is_auto(cli.polly) && cfg.compiler == cli::Compiler::Clang);
+        cfg.polly = user_polly && cfg.compiler == cli::Compiler::Clang;
     }
 
     // LTO: enabled if explicitly set or auto + available
-    cfg.lto = is_enabled(cli.lto) || (is_auto(cli.lto) && !is_disabled(cli.lto));
+    cfg.lto = is_enabled(cli.lto);
 
     // Mold: enabled if explicitly set, auto, and tool available
-    cfg.mold = is_enabled(cli.mold) || (is_auto(cli.mold) && mold_available());
+    cfg.mold = is_enabled(cli.mold) && mold_available();
 
     return cfg;
 }
@@ -93,13 +76,14 @@ std::tuple<std::string, std::string, std::string> OptConfig::apply_flags() const
         return val ? val : "";
     };
 
-    std::string cflags = get_env("CFLAGS");
-    std::string cxxflags = get_env("CXXFLAGS");
-    std::string ldflags = get_env("LDFLAGS");
+    return apply_flags_to(get_env("CFLAGS"), get_env("CXXFLAGS"), get_env("LDFLAGS"));
+}
+
+std::tuple<std::string, std::string, std::string> OptConfig::apply_flags_to(
+    std::string cflags, std::string cxxflags, std::string ldflags) const {
 
     // Graphite optimizations (GCC polyhedral)
     if (graphite) {
-        auto nproc = cpu_count();
         std::string gf = " -fgraphite-identity -floop-interchange -floop-nest-optimize"
                          " -ftree-loop-distribution -ftree-vectorize";
         cflags += gf;
@@ -108,9 +92,10 @@ std::tuple<std::string, std::string, std::string> OptConfig::apply_flags() const
 
     // Polly optimizations (Clang polyhedral)
     if (polly) {
-        std::string pf = " -mllvm -polly -mllvm -polly-parallel -lgomp";
+        std::string pf = " -mllvm -polly";
         cflags += pf;
         cxxflags += pf;
+        ldflags += " -mllvm -polly";
     }
 
     // LTO

@@ -1,12 +1,14 @@
-#include "pacmkr/deps.h"
-#include "pacmkr/aur.h"
-#include "pacmkr/aur_cache.h"
-#include "pacmkr/alpm.h"
-#include "pacmkr/status.h"
-#include "pacmkr/error.h"
+#include "pacmkr/backend/deps.h"
+#include "pacmkr/backend/aur.h"
+#include "pacmkr/backend/aur_cache.h"
+#include "pacmkr/backend/alpm.h"
+#include "pacmkr/core/error.h"
+#include "pacmkr/app/terminal.h"
 
-#include <algorithm>
+#include <chrono>
+#include <cctype>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <queue>
 #include <set>
@@ -301,15 +303,11 @@ std::string parse_dep_spec(const std::string& spec) {
 }
 
 bool check_installed(const std::string& dep) {
-    std::ostringstream cmd;
-    cmd << "pacman -Qi " << dep << " >/dev/null 2>&1";
-    return std::system(cmd.str().c_str()) == 0;
+    return alpm::get_local_package(parse_dep_spec(dep)).has_value();
 }
 
 bool check_official(const std::string& dep) {
-    std::ostringstream cmd;
-    cmd << "pacman -Si " << dep << " >/dev/null 2>&1";
-    return std::system(cmd.str().c_str()) == 0;
+    return alpm::get_sync_package(parse_dep_spec(dep)).has_value();
 }
 
 std::string parse_pacman_version(const std::string& output) {
@@ -388,28 +386,59 @@ DepGraph resolve(const std::vector<std::string>& roots,
                  bool _include_optdeps) {
     DepGraph graph;
 
-    // Fetch metadata for all root + discovered AUR packages
+    // Discover + fetch AUR packages in batches (parallel RPC calls).
+    // Each round: collect unknown names → batch-fetch → discover new deps.
     std::set<std::string> to_fetch(roots.begin(), roots.end());
     std::map<std::string, aur::AurPackageInfo> resolved;
 
     while (!to_fetch.empty()) {
-        auto it = to_fetch.begin();
-        std::string pkg = *it;
-        to_fetch.erase(it);
+        // Collect all names to fetch this round
+        std::vector<std::string> batch(to_fetch.begin(), to_fetch.end());
+        to_fetch.clear();
 
-        if (resolved.find(pkg) != resolved.end()) continue;
-
+        // Batch-fetch all packages in one RPC call
+        std::vector<aur::AurPackageInfo> infos;
         try {
-            resolved[pkg] = aur::fetch(pkg);
+            infos = aur::fetch_batch(batch);
         } catch (const source_error&) {
-            // Package not in AUR — might be a virtual provide or official
-            std::cerr << "warning: '" << pkg << "' not found in AUR\n";
+            std::cerr << "warning: AUR batch fetch failed\n";
+            for (auto& pkg : batch) {
+                std::cerr << "warning: '" << pkg << "' not found in AUR\n";
+            }
+            continue;
+        }
+
+        // Process results and discover new dependencies
+        auto process_info = [&](const aur::AurPackageInfo& info) {
+            auto add_new_deps = [&](const std::vector<std::string>& dependencies) {
+                for (const auto& raw : dependencies) {
+                    const auto name = parse_dep_spec(raw);
+                    if (!name.empty() && !check_installed(name) && !check_official(name)
+                        && resolved.find(name) == resolved.end()
+                        && to_fetch.find(name) == to_fetch.end()) {
+                        to_fetch.insert(name);
+                    }
+                }
+            };
+            add_new_deps(info.depends);
+            if (include_makedeps) add_new_deps(info.makedepends);
+            if (include_checkdeps) add_new_deps(info.checkdepends);
+            resolved[info.name] = info;
+        };
+
+        for (auto& info : infos) {
+            try {
+                process_info(info);
+            } catch (const source_error&) {
+                std::cerr << "warning: '" << info.name << "' not found in AUR\n";
+            }
         }
     }
 
     // Build dependency edges
     for (auto& [name, info] : resolved) {
         BuildNode node{name};
+        node.info = info;
 
         // Collect deps
         auto add_dep = [&](const std::vector<std::string>& dep_list, DepKind kind) {
@@ -430,7 +459,6 @@ DepGraph resolve(const std::vector<std::string>& roots,
 
                 // Must be AUR
                 node.aur_deps.push_back(dep_name);
-                to_fetch.insert(dep_name);
             }
         };
 
@@ -536,57 +564,102 @@ DepGraph resolve(const std::vector<std::string>& roots,
     return graph;
 }
 
-std::vector<OutOfDatePkg> detect_out_of_date() {
-    std::vector<OutOfDatePkg> result;
+namespace {
 
-    // Get installed packages via alpm
-    std::vector<alpm::Package> local_pkgs;
+// Collect installed foreign packages (name + version). Must run on the thread
+// that owns the libalpm handle, and before any transaction is started.
+bool collect_foreign(std::vector<std::string>& names,
+                     std::map<std::string, std::string>& versions) {
+    std::vector<alpm::Package> foreign_packages;
     try {
-        local_pkgs = alpm::get_local_packages();
+        foreign_packages = alpm::get_foreign_packages();
     } catch (...) {
-        return result; // alpm not available
+        return false; // alpm not available
     }
-
-    // Collect foreign package names (not in official repos)
-    std::vector<std::string> foreign_names;
-    for (auto& pkg : local_pkgs) {
-        try {
-            auto sync_pkg = alpm::get_sync_package(pkg.name);
-            if (sync_pkg) continue; // In official repos, skip
-        } catch (...) {}
-        foreign_names.push_back(pkg.name);
+    for (const auto& pkg : foreign_packages) {
+        names.push_back(pkg.name);
+        versions[pkg.name] = pkg.version;
     }
+    return true;
+}
 
+// Given the pre-collected foreign set, work out which packages have an AUR
+// update. Uses the on-disk cache when every name was checked recently;
+// otherwise issues one batch RPC query and records the outcome for next time.
+// This function touches no libalpm state, so it is safe to run on a worker
+// thread while a transaction is in progress.
+std::vector<OutOfDatePkg> resolve_out_of_date(
+    const std::vector<std::string>& foreign_names,
+    const std::map<std::string, std::string>& installed_versions,
+    bool quiet) {
+    std::vector<OutOfDatePkg> result;
     if (foreign_names.empty()) return result;
 
-    // Batch-fetch AUR info for all foreign packages in one API call
-    // This is MUCH faster than per-package HTTP requests
-    try {
-        httplib::Client cli("aur.archlinux.org");
-        cli.set_connection_timeout(std::chrono::seconds(5));
-        cli.set_read_timeout(std::chrono::seconds(15));
+    auto description_of = [](const nlohmann::json& obj) -> std::string {
+        return obj.contains("Description") && obj.at("Description").is_string()
+                   ? obj.at("Description").get<std::string>() : std::string{};
+    };
 
-        std::string args;
-        for (size_t i = 0; i < foreign_names.size(); ++i) {
-            if (i > 0) args += ",";
-            args += foreign_names[i];
+    // Fast path: every foreign package was checked against the AUR recently, so
+    // trust the cache. A name checked recently but absent from the cache is
+    // known to not be an AUR package (so, no update) rather than a cache miss.
+    bool all_known = true;
+    std::vector<OutOfDatePkg> cached;
+    for (const auto& name : foreign_names) {
+        if (!aur_cache::checked_recently(name)) all_known = false;
+        const auto entry = aur_cache::get(name);
+        if (!entry) continue;
+        const auto version = entry->value("Version", std::string{});
+        if (version.empty()) continue;
+        if (compare_versions(version, installed_versions.at(name)) > 0) {
+            cached.push_back({name, installed_versions.at(name), version,
+                              description_of(*entry)});
+        }
+    }
+    if (all_known) {
+        if (!quiet) {
+            std::cout << "==> Checked " << foreign_names.size()
+                      << " foreign package(s) using cached AUR metadata\n";
+        }
+        return cached;
+    }
+
+    // Batch-fetch AUR info for all foreign packages in one API call.
+    try {
+        if (!quiet) {
+            std::cout << "==> Checking " << foreign_names.size()
+                      << " foreign package(s) against the AUR..." << std::flush;
         }
 
-        auto res = cli.Get("/rpc?v=5&type=info&arg=" + args);
+        httplib::Client cli("https://aur.archlinux.org");
+        cli.set_connection_timeout(std::chrono::seconds(5));
+        cli.set_read_timeout(std::chrono::seconds(15));
+        cli.set_write_timeout(std::chrono::seconds(5));
+
+        std::string path = "/rpc?v=5&type=info";
+        for (const auto& name : foreign_names) {
+            path += "&arg[]=" + detail::url_encode(name);
+        }
+
+        auto res = cli.Get(path);
+        if (!quiet) std::cout << " done\n";
         if (res && res->status == 200) {
             auto data = nlohmann::json::parse(res->body);
             if (data.contains("results")) {
+                aur_cache::merge_results(data["results"]);
+                aur_cache::note_checked(foreign_names);
+
                 // Build a map of name -> AUR version
                 std::map<std::string, std::string> aur_versions;
                 std::map<std::string, std::string> aur_descs;
 
                 for (auto& item : data["results"]) {
-                    std::string nv = item.value("NameVersion", "");
-                    auto dash_pos = nv.find('-');
-                    std::string ver = (dash_pos != std::string::npos) ? nv.substr(0, dash_pos) : nv;
-                    aur_versions[item.at("PackageBase").get<std::string>()] = ver;
+                    const std::string name = item.value("Name", "");
+                    const std::string version = item.value("Version", "");
+                    if (name.empty() || version.empty()) continue;
+                    aur_versions[name] = version;
                     if (item.contains("Description") && item.at("Description").is_string()) {
-                        aur_descs[item.at("PackageBase").get<std::string>()] = item.at("Description").get<std::string>();
+                        aur_descs[name] = item.at("Description").get<std::string>();
                     }
                 }
 
@@ -594,13 +667,7 @@ std::vector<OutOfDatePkg> detect_out_of_date() {
                 for (auto& name : foreign_names) {
                     auto it = aur_versions.find(name);
                     if (it != aur_versions.end()) {
-                        std::string installed_ver;
-                        for (auto& pkg : local_pkgs) {
-                            if (pkg.name == name) {
-                                installed_ver = pkg.version;
-                                break;
-                            }
-                        }
+                        const auto& installed_ver = installed_versions.at(name);
 
                         if (!installed_ver.empty() && !it->second.empty()) {
                             if (compare_versions(it->second, installed_ver) > 0) {
@@ -614,35 +681,55 @@ std::vector<OutOfDatePkg> detect_out_of_date() {
                     }
                 }
             }
+        } else {
+            std::cerr << "warning: AUR query failed"
+                      << (res ? " with HTTP " + std::to_string(res->status)
+                              : " before receiving a response")
+                      << "; using cached metadata\n";
+            result = std::move(cached);
         }
     } catch (...) {
         // Batch fetch failed — fall back to cache-only (no network)
         std::cerr << "warning: AUR batch query failed, using cache only\n";
-        for (auto& name : foreign_names) {
-            if (aur_cache::has(name)) {
-                auto ootd_info = aur_cache::check_ootd(name, ""); // version unknown from alpm
-                if (ootd_info.is_out_of_date) {
-                    std::string desc;
-                    auto cached = aur_cache::get(name);
-                    if (cached.has_value()) {
-                        desc = cached.value().value("Description", "");
-                    }
-                    result.push_back({name, "", ootd_info.aur_version, desc});
-                }
-            }
-        }
+        result = std::move(cached);
     }
 
     return result;
 }
 
+} // namespace
+
+std::future<std::vector<OutOfDatePkg>> detect_out_of_date_async() {
+    std::vector<std::string> foreign_names;
+    std::map<std::string, std::string> installed_versions;
+    const bool ok = collect_foreign(foreign_names, installed_versions);
+
+    if (!ok || foreign_names.empty()) {
+        std::promise<std::vector<OutOfDatePkg>> done;
+        done.set_value({});
+        return done.get_future();
+    }
+
+    return std::async(std::launch::async,
+        [names = std::move(foreign_names),
+         versions = std::move(installed_versions)]() {
+            return resolve_out_of_date(names, versions, /*quiet=*/true);
+        });
+}
+
+std::vector<OutOfDatePkg> detect_out_of_date() {
+    std::vector<std::string> foreign_names;
+    std::map<std::string, std::string> installed_versions;
+    if (!collect_foreign(foreign_names, installed_versions)) return {};
+    return resolve_out_of_date(foreign_names, installed_versions, /*quiet=*/false);
+}
+
 void print_upgrade_plan(const std::vector<OutOfDatePkg>& ootd) {
     if (ootd.empty()) {
-        status::print_success("AUR packages are up to date");
         return;
     }
 
-    status::print_section(std::to_string(ootd.size()) + " AUR package(s) have updates available");
+    terminal::info(std::to_string(ootd.size()) + " package update(s) available");
     for (auto& pkg : ootd) {
         std::cout << "  " << pkg.name << " " << pkg.installed_version
                   << " → " << pkg.aur_version << "\n";
@@ -656,13 +743,14 @@ void print_upgrade_plan(const std::vector<OutOfDatePkg>& ootd) {
 }
 
 void DepGraph::print_plan(const std::vector<std::string>& roots) const {
-    std::cout << "\n==> Dependency resolution complete.\n\n";
+    terminal::success("Dependencies resolved");
+    std::cout << "\n";
 
     if (!build_order.empty()) {
         // Show parallel build groups
         if (!parallel_groups.empty()) {
-            std::cout << "Packages to build (" << build_order.size() << " total, "
-                      << parallel_groups.size() << " parallel stages):\n";
+            std::cout << "Build plan (" << build_order.size() << " package(s), "
+                      << parallel_groups.size() << " stage(s)):\n";
             for (size_t i = 0; i < parallel_groups.size(); ++i) {
                 auto& group = parallel_groups[i];
                 std::cout << "  Stage " << (i + 1) << ": ";
@@ -693,7 +781,7 @@ void DepGraph::print_plan(const std::vector<std::string>& roots) const {
             }
         }
     } else {
-        status::print_status("No AUR packages to build");
+        terminal::success("No AUR packages to build");
     }
 
     if (!satisfied_deps.empty()) {

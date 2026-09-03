@@ -6,6 +6,7 @@
 #include <sstream>
 #include <optional>
 #include <algorithm>
+#include "pacmkr/build/pkgbuild.h"
 
 // Inline PKGBUILD parser for testing (mirrors pkgbuild.cpp)
 
@@ -240,12 +241,50 @@ void test_pkgbase_from_pkgname() {
     std::cout << "  PASSED: pkgbase_from_pkgname\n";
 }
 
+void test_real_parser_multiline_and_functions() {
+    const auto parsed = pacmkr::pkgbuild::Pkgbuild::parse_content(R"(
+pkgname=('one' 'two')
+pkgver=3.2
+pkgrel=4
+_pkgname=code
+source_x86_64=("code_${pkgver}_amd64.deb::https://example.test/code.deb")
+sha256sums_x86_64=('arch-checksum')
+source=(
+  "https://example.test/${pkgname}-${pkgver}.tar.gz"
+  'fix.patch'
+)
+depends=(
+  'glibc'
+  'zlib'
+)
+prepare() {
+  depends=('must-not-leak')
+}
+package_one() { :; }
+package_two() { :; }
+)");
+    assert((parsed.pkgname == std::vector<std::string>{"one", "two"}));
+    assert((parsed.depends == std::vector<std::string>{"glibc", "zlib"}));
+    assert(parsed.variables.at("_pkgname") == "code");
+#if defined(__x86_64__)
+    assert(parsed.source.size() == 3);
+    assert(parsed.source.back().find("code_${pkgver}_amd64.deb") == 0);
+    assert(parsed.sha256sums.back() == "arch-checksum");
+#else
+    assert(parsed.source.size() == 2);
+#endif
+    assert(parsed.has_function("prepare"));
+    assert(parsed.has_function("package_one"));
+    assert(parsed.pkgbase() == "one");
+}
+
 int main() {
     std::cout << "Running pkgbuild tests...\n";
     test_parse_simple_pkgbuild();
     test_parse_array();
     test_full_version();
     test_pkgbase_from_pkgname();
+    test_real_parser_multiline_and_functions();
     std::cout << "All pkgbuild tests passed.\n";
     return 0;
 }

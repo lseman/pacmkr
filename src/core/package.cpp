@@ -1,6 +1,6 @@
-#include "pacmkr/package.h"
-#include "pacmkr/pkgbuild.h"
-#include "pacmkr/error.h"
+#include "pacmkr/core/package.h"
+#include "pacmkr/build/pkgbuild.h"
+#include "pacmkr/core/error.h"
 
 #include <fstream>
 #include <filesystem>
@@ -10,6 +10,12 @@
 namespace pacmkr::package {
 
 namespace {
+
+std::string shell_quote(const std::string& value) {
+    std::string result{"'"};
+    for (char c : value) result += c == '\'' ? "'\\''" : std::string(1, c);
+    return result + "'";
+}
 
 uint64_t calc_dir_size(const std::filesystem::path& path) {
     uint64_t size = 0;
@@ -45,7 +51,7 @@ Package Package::make(const std::string& name, const std::string& version,
     pkg.name = name;
     pkg.version = version;
     pkg.arch = arch;
-    pkg.dest = dest_dir / (name + "-" + version + ".pkg.tar.zst");
+    pkg.dest = dest_dir / (name + "-" + version + "-" + arch + ".pkg.tar.zst");
     return pkg;
 }
 
@@ -85,10 +91,10 @@ void Package::write_pkginfo(const pkgbuild::Pkgbuild& pb,
 void Package::create_archive(const std::filesystem::path& pkgdir) const {
     std::cout << "==> Compressing package...\n";
 
-    // Use bsdtar for Arch Linux compatibility
-    int rc = std::system(
-        ("bsdtar --no-fflags --no-read-sparse -cJf \"" +
-         dest.string() + "\" -C \"" + pkgdir.string() + "\" . 2>&1").c_str());
+    // Arch package names ending in .zst must contain a zstd stream.
+    const std::string command = "bsdtar --no-fflags --no-read-sparse -cf - -s ',^\\./,,' -C " +
+        shell_quote(pkgdir.string()) + " . | zstd -q -T0 -o " + shell_quote(dest.string());
+    int rc = std::system(command.c_str());
 
     if (rc != 0) {
         throw package_error("bsdtar failed to create package archive");

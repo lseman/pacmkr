@@ -1,6 +1,6 @@
-#include "pacmkr/remove.h"
-#include "pacmkr/alpm.h"
-#include "pacmkr/error.h"
+#include "pacmkr/backend/remove.h"
+#include "pacmkr/backend/alpm.h"
+#include "pacmkr/core/error.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -124,15 +124,8 @@ int cascade_remove(const std::vector<std::string>& packages, bool noconfirm) {
         }
     }
 
-    // Build pacman command
-    std::ostringstream cmd;
-    cmd << "pacman -Rns --noconfirm";
-    for (auto& pkg : to_remove) {
-        cmd << " " << pkg;
-    }
-
     std::cout << "\n==> Removing packages...\n";
-    int rc = std::system(cmd.str().c_str());
+    int rc = alpm::remove({to_remove.begin(), to_remove.end()}, true, true, true, noconfirm);
 
     if (rc == 0) {
         std::cout << "==> Packages removed successfully.\n";
@@ -145,20 +138,8 @@ int cascade_remove(const std::vector<std::string>& packages, bool noconfirm) {
 
 int recursive_remove(const std::vector<std::string>& packages, bool noconfirm) {
     // Remove packages and their unused dependencies
-    std::ostringstream cmd;
-    cmd << "pacman -Rns";
-    for (auto& pkg : packages) {
-        cmd << " " << pkg;
-    }
-
-    if (!noconfirm) {
-        cmd << " --ask 1"; // Ask to remove unused dependencies
-    } else {
-        cmd << " --noconfirm";
-    }
-
     std::cout << "==> Removing packages and unused dependencies...\n";
-    int rc = std::system(cmd.str().c_str());
+    int rc = alpm::remove(packages, true, false, true, noconfirm);
 
     if (rc == 0) {
         std::cout << "==> Packages removed successfully.\n";
@@ -171,36 +152,8 @@ int recursive_remove(const std::vector<std::string>& packages, bool noconfirm) {
 
 int remove_unneeded(bool noconfirm) {
     // Find orphans (deps not required by any explicit package)
-    auto installed = get_installed_packages();
     std::vector<std::string> orphans;
-
-    for (auto& pkg : installed) {
-        if (is_explicit(pkg)) continue;
-
-        bool still_needed = false;
-        auto deps = get_package_deps(pkg);
-        for (auto& dep : deps) {
-            // Simple check: if this package is a dependency of another, it's needed
-            // We'd need full reverse dep scan for accurate results
-        }
-
-        // Use pacman -Qdt to find orphans
-        std::ostringstream cmd;
-        cmd << "pacman -Qdt --quiet 2>/dev/null";
-        FILE* pipe = popen(cmd.str().c_str(), "r");
-        if (pipe) {
-            char buf[256];
-            while (fgets(buf, sizeof(buf), pipe)) {
-                std::string line(buf);
-                // Trim whitespace
-                line.erase(line.find_last_not_of(" \t\r\n") + 1);
-                if (!line.empty()) {
-                    orphans.push_back(line);
-                }
-            }
-            pclose(pipe);
-        }
-    }
+    for (const auto& pkg : alpm::get_orphan_packages()) orphans.push_back(pkg.name);
 
     if (orphans.empty()) {
         std::cout << "==> No unneeded packages found.\n";
@@ -224,12 +177,8 @@ int remove_unneeded(bool noconfirm) {
         }
     }
 
-    // Remove orphans
-    std::ostringstream cmd;
-    cmd << "pacman -Rns$(pacman -Qdt --quiet) --noconfirm";
-
     std::cout << "\n==> Removing unneeded packages...\n";
-    int rc = std::system(cmd.str().c_str());
+    int rc = alpm::remove(orphans, true, false, true, noconfirm);
 
     if (rc == 0) {
         std::cout << "==> Unneeded packages removed successfully.\n";

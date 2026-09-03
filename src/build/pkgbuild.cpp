@@ -1,8 +1,9 @@
-#include "pacmkr/pkgbuild.h"
-#include "pacmkr/error.h"
+#include "pacmkr/build/pkgbuild.h"
+#include "pacmkr/core/error.h"
 
 #include <fstream>
 #include <algorithm>
+#include <sys/utsname.h>
 
 namespace pacmkr::pkgbuild {
 
@@ -77,10 +78,12 @@ bool is_var_assignment(const std::string& line) {
     auto eq = t.find('=');
     if (eq == std::string::npos) return false;
 
-    auto key = t.substr(0, eq);
-    // Trim and validate key
-    auto k = trim(key);
-    if (k.empty() || k.front() == '(' || k[0] == '_' || detail::starts_with(k, "_")) return false;
+    const auto k = trim(t.substr(0, eq));
+    if (k.empty() || (!std::isalpha(static_cast<unsigned char>(k.front())) && k.front() != '_'))
+        return false;
+    if (!std::all_of(k.begin() + 1, k.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '_';
+        })) return false;
 
     return true;
 }
@@ -185,76 +188,59 @@ Pkgbuild Pkgbuild::parse(const std::filesystem::path& path) {
 
     std::string content((std::istreambuf_iterator<char>(in)),
                          std::istreambuf_iterator<char>());
-    return parse_content(content);
+    auto parsed = parse_content(content);
+    parsed.source_path = std::filesystem::absolute(path);
+    return parsed;
 }
 
 Pkgbuild Pkgbuild::parse_content(const std::string& content) {
     Pkgbuild pkg{};
+    pkg.raw_content = content;
 
-    // Find package function ranges to skip during var extraction
-    struct FuncRange { size_t start, end; };
-    std::vector<FuncRange> func_ranges;
-    {
-        std::istringstream stream(content);
-        std::string line;
-        size_t line_idx = 0;
-        while (std::getline(stream, line)) {
-            auto t = trim(line);
-            if (detail::starts_with(t, "package_") && t.find("()") != std::string::npos) {
-                FuncRange r{line_idx, line_idx + 1};
-                size_t brace_pos = t.rfind('{');
-                int depth = 0;
-
-                if (brace_pos != std::string::npos) {
-                    for (size_t j = brace_pos; j < t.size(); ++j) {
-                        if (t[j] == '{') depth++;
-                        else if (t[j] == '}') depth--;
-                    }
-                }
-
-                if (depth > 0 || (brace_pos != std::string::npos && !(trim(line).empty()) && trim(line).back() == '{')) {
-                    for (size_t k = line_idx + 1; k < static_cast<size_t>(-1); ++k) {
-                        if (k >= static_cast<size_t>(100000)) break;  // safety
-                        // We need to re-read lines — let's use a different approach
-                        break;
-                    }
-                }
-
-                func_ranges.push_back(r);
-            }
-            ++line_idx;
-        }
-    }
-
-    // Simpler approach: just parse variables, skipping function definitions
     std::map<std::string, std::string> vars;
     std::istringstream stream(content);
     std::string line;
+    std::string pending;
+    int function_depth = 0;
+    auto delta = [](const std::string& value, char open, char close) {
+        int result = 0;
+        bool quoted = false;
+        char quote = 0;
+        for (size_t i = 0; i < value.size(); ++i) {
+            const char c = value[i];
+            if (quoted) {
+                if (c == quote && (i == 0 || value[i - 1] != '\\')) quoted = false;
+            } else if (c == '\'' || c == '"') { quoted = true; quote = c; }
+            else if (c == open) ++result;
+            else if (c == close) --result;
+        }
+        return result;
+    };
 
     while (std::getline(stream, line)) {
         auto t = trim(line);
-
-        // Skip empty lines and comments
         if (t.empty() || t.front() == '#') continue;
-
-        // Skip function definitions (but not package_name())
-        if (t.find("()") != std::string::npos && !detail::starts_with(t, "package_")) continue;
-
-        // Parse variable assignments
-        if (!is_var_assignment(t)) continue;
-
-        auto [key, value] = parse_var(t);
-
-        auto it = vars.find(key);
-        if (it == vars.end()) {
-            vars[key] = value;
-        } else {
-            // Array append: check if previous line also had no leading whitespace
-            it->second += ' ' + value;
+        if (function_depth > 0) {
+            function_depth += delta(t, '{', '}');
+            continue;
         }
+        if (t.find("()") != std::string::npos && t.find('{') != std::string::npos) {
+            function_depth = std::max(0, delta(t, '{', '}'));
+            continue;
+        }
+        if (!pending.empty()) pending += " " + t;
+        else if (is_var_assignment(t)) pending = t;
+        else continue;
+        const auto equals = pending.find('=');
+        if (equals != std::string::npos && delta(pending.substr(equals + 1), '(', ')') > 0) continue;
+        auto [key, value] = parse_var(pending);
+        vars[key] = value;
+        pending.clear();
     }
 
     // Extract fields
+    for (const auto& [name, value] : vars) pkg.variables[name] = strip_quotes(value);
+
     auto get_vec = [&](const std::string& key) -> std::vector<std::string> {
         auto it = vars.find(key);
         if (it == vars.end()) return {};
@@ -270,7 +256,7 @@ Pkgbuild Pkgbuild::parse_content(const std::string& content) {
     };
 
     // pkgbase from pkgname if not set
-    pkg.pkgbase_opt = get_str("pkgbase");
+    if (auto base = get_str("pkgbase"); !base.empty()) pkg.pkgbase_opt = std::move(base);
     pkg.pkgname = get_vec("pkgname");
     pkg.pkgver = get_str("pkgver", "0");
     pkg.pkgrel = get_str("pkgrel", "1");
@@ -298,34 +284,29 @@ Pkgbuild Pkgbuild::parse_content(const std::string& content) {
     pkg.sha1sums = get_vec("sha1sums");
     pkg.validpgpkeys = get_vec("validpgpkeys");
 
-    // Extract package() sections for split packages
-    {
-        std::istringstream s2(content);
-        std::string l;
-        size_t idx = 0;
-        while (std::getline(s2, l)) {
-            auto t = trim(l);
-            if (!detail::starts_with(t, "package_")) { ++idx; continue; }
-            if (t.find("()") == std::string::npos) { ++idx; continue; }
+    struct utsname system_info{};
+    if (uname(&system_info) == 0) {
+        const std::string suffix = "_" + std::string(system_info.machine);
+        auto append = [&](std::vector<std::string>& target, const std::string& key) {
+            auto values = get_vec(key + suffix);
+            target.insert(target.end(), values.begin(), values.end());
+        };
+        append(pkg.source, "source");
+        append(pkg.md5sums, "md5sums");
+        append(pkg.sha1sums, "sha1sums");
+        append(pkg.sha224sums, "sha224sums");
+        append(pkg.sha256sums, "sha256sums");
+        append(pkg.sha384sums, "sha384sums");
+        append(pkg.sha512sums, "sha512sums");
+        append(pkg.b2sums, "b2sums");
+    }
 
-            // Extract name
-            auto fp = t.substr(0, t.find('('));
-            std::string name = trim(fp);
-            if (detail::starts_with(name, "package_")) name = name.substr(8);
-
-            // Find body
-            PackageSection section{name};
-            ++idx;
-            bool found_open = false;
-            for (; idx < static_cast<size_t>(-1) && !found_open; ++idx) {
-                if (idx >= 100000) break;
-                auto tl = trim(content);  // simplified — just grab what we can
-                section.body += l + "\n";
-                if (l.find('{') != std::string::npos) found_open = true;
-            }
-
-            pkg.packages.push_back(std::move(section));
-        }
+    std::istringstream functions(content);
+    while (std::getline(functions, line)) {
+        const auto value = trim(line);
+        if (!detail::starts_with(value, "package_") || value.find("()") == std::string::npos) continue;
+        const auto end = value.find('(');
+        pkg.packages.push_back({value.substr(8, end - 8), {}});
     }
 
     return pkg;
@@ -345,9 +326,13 @@ std::string Pkgbuild::full_version() const {
 }
 
 bool Pkgbuild::has_function(const std::string& name) const {
-    // Check for standalone functions (build, check, prepare)
-    if (name == "prepare" || name == "build" || name == "check") {
-        return false;  // Would need to scan raw content — simplified
+    std::istringstream input(raw_content);
+    for (std::string line; std::getline(input, line);) {
+        const auto value = trim(line);
+        if (detail::starts_with(value, name)) {
+            const auto rest = trim(value.substr(name.size()));
+            if (detail::starts_with(rest, "()")) return true;
+        }
     }
     // package_name() sections
     for (auto& p : packages) {

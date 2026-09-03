@@ -1,15 +1,16 @@
-#include "pacmkr/aur_cache.h"
-#include "pacmkr/error.h"
+#include "pacmkr/backend/aur_cache.h"
+#include "pacmkr/core/error.h"
 
 #include <map>
 #include <httplib.h>
-#include <nlohmann/json.hpp>
+#include <json.hpp>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <cctype>
 
 namespace pacmkr::aur_cache {
 
@@ -22,30 +23,13 @@ static std::filesystem::path get_cache_path() {
     const char* xdg_cache = std::getenv("XDG_CACHE_HOME");
     std::filesystem::path base;
     if (xdg_cache && std::string(xdg_cache).size() > 0) {
-        base = xdg_cache;
+        return std::filesystem::path{xdg_cache} / "pacmkr" / "aur-cache.json";
     } else {
         const char* home = std::getenv("HOME");
         if (!home) return std::filesystem::temp_directory_path() / "pacmkr" / "aur-cache.json";
         base = home;
     }
     return base / ".cache" / "pacmkr" / "aur-cache.json";
-}
-
-/// URL encode a string (only special characters).
-static std::string url_encode(const std::string& s) {
-    static const std::string safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.";
-    std::string result;
-    for (char c : s) {
-        if (safe.find(c) != std::string::npos) {
-            result += c;
-        } else {
-            result += '%';
-            char hex[3];
-            std::snprintf(hex, sizeof(hex), "%02X", static_cast<unsigned char>(c));
-            result += hex;
-        }
-    }
-    return result;
 }
 
 /// Fetch all AUR packages via the RPC API.
@@ -100,9 +84,22 @@ static int ver_cmp(const std::string& a, const std::string& b) {
 
 } // anonymous
 
+// How long an AUR check stays trustworthy for upgrade detection. The real
+// build always pulls fresh PKGBUILDs, so this only bounds the staleness of the
+// "is an update available" pre-check.
+static constexpr auto kCheckTtl = std::chrono::hours(3);
+
+/// Seconds since the Unix epoch.
+static long long now_unix() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 // ─── Global state (file-local, accessible to all functions in this file) ──
 
 static std::map<std::string, nlohmann::json> g_aur_data;  // name -> full JSON object
+static std::map<std::string, long long> g_checked;        // name -> last-checked unix time
 static bool g_initialized{false};
 static bool g_loaded_from_disk{false};
 
@@ -117,6 +114,11 @@ static bool load_from_disk() {
 
     try {
         json data = json::parse(file);
+        if (data.contains("checked") && data["checked"].is_object()) {
+            for (auto& [name, ts] : data["checked"].items()) {
+                if (ts.is_number()) g_checked[name] = ts.get<long long>();
+            }
+        }
         if (data.contains("packages") && data["packages"].is_array()) {
             for (auto& pkg : data["packages"]) {
                 if (pkg.contains("Name")) {
@@ -140,6 +142,10 @@ static void save_to_disk() {
     for (auto& [name, pkg] : g_aur_data) {
         data["packages"].push_back(pkg);
     }
+    data["checked"] = json::object();
+    for (auto& [name, ts] : g_checked) {
+        data["checked"][name] = ts;
+    }
 
     std::ofstream file(path);
     if (file) {
@@ -147,20 +153,14 @@ static void save_to_disk() {
     }
 }
 
-static bool is_cache_stale() {
+static bool cache_is_stale() {
     auto path = get_cache_path();
     if (!std::filesystem::exists(path)) return true;
 
-    // Get file mtime as epoch seconds
-    auto file_time = std::filesystem::last_write_time(path);
-    auto file_epoch = file_time.time_since_epoch();
-    auto file_secs = std::chrono::duration_cast<std::chrono::seconds>(file_epoch).count();
-
-    // Get current time as epoch seconds
-    auto now_epoch = std::chrono::system_clock::now().time_since_epoch();
-    auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(now_epoch).count();
-
-    return (now_secs - file_secs) > 86400;  // 24 hours in seconds
+    std::error_code error;
+    const auto modified = std::filesystem::last_write_time(path, error);
+    if (error) return true;
+    return std::filesystem::file_time_type::clock::now() - modified > kCheckTtl;
 }
 
 // ─── Public API ──────────────────────────────────────────────────────
@@ -171,8 +171,9 @@ void init(bool force_refresh) {
     // Load from disk first
     g_loaded_from_disk = load_from_disk();
 
-    // Fetch fresh data if forced or cache is stale
-    if (force_refresh || (g_loaded_from_disk && is_cache_stale())) {
+    // Normal startup is disk-only. Upgrade checks refresh just the installed
+    // foreign packages, avoiding a large global AUR request on the hot path.
+    if (force_refresh) {
         try {
             json response = fetch_all_packages();
             if (response.contains("results") && response["results"].is_array()) {
@@ -289,6 +290,33 @@ bool has(const std::string& name) {
     return g_aur_data.find(name) != g_aur_data.end();
 }
 
+bool is_fresh() {
+    return g_loaded_from_disk && !cache_is_stale();
+}
+
+void merge_results(const nlohmann::json& results) {
+    if (!results.is_array()) return;
+    for (const auto& pkg : results) {
+        const auto name = pkg.value("Name", std::string{});
+        if (!name.empty()) g_aur_data[name] = pkg;
+    }
+    save_to_disk();
+    g_loaded_from_disk = true;
+}
+
+void note_checked(const std::vector<std::string>& names) {
+    const long long now = now_unix();
+    for (const auto& name : names) g_checked[name] = now;
+    save_to_disk();
+}
+
+bool checked_recently(const std::string& name) {
+    auto it = g_checked.find(name);
+    if (it == g_checked.end()) return false;
+    const auto age = std::chrono::seconds(now_unix() - it->second);
+    return age >= std::chrono::seconds(0) && age < kCheckTtl;
+}
+
 OutOfDateInfo check_ootd(const std::string& pkgname, const std::string& local_version) {
     OutOfDateInfo info{};
     info.is_out_of_date = false;
@@ -298,7 +326,7 @@ OutOfDateInfo check_ootd(const std::string& pkgname, const std::string& local_ve
     if (it == g_aur_data.end()) return info;  // Not in AUR
 
     const auto& pkg = it->second;
-    std::string aur_version = pkg.value("NameVersion", "");  // e.g. "1.0-1"
+    std::string aur_version = pkg.value("Version", "");
     info.aur_version = aur_version;
     info.outofdate_ts = pkg.value("OutOfDate", 0ULL);
 
@@ -322,6 +350,7 @@ std::filesystem::path cache_path() {
 void refresh() {
     g_aur_data.clear();
     g_loaded_from_disk = false;
+    g_initialized = false;
     init(true);
 }
 

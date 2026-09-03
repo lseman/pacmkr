@@ -1,5 +1,5 @@
-#include "pacmkr/local_repo.h"
-#include "pacmkr/optimize.h"
+#include "pacmkr/backend/local_repo.h"
+#include "pacmkr/core/optimize.h"
 
 #include <algorithm>
 #include <cctype>
@@ -80,35 +80,35 @@ std::filesystem::path database(const std::string& name,
 void print_help() {
     std::cout <<
         "Usage:\n"
-        "  pacmkr repo create <name> <directory>\n"
-        "  pacmkr repo add <name> <package.pkg.tar.zst>...\n"
-        "  pacmkr repo remove <name> <package-name>...\n"
-        "  pacmkr repo list\n"
-        "  pacmkr repo delete <name>\n";
+        "  pacmkr-repo create <name> <directory>\n"
+        "  pacmkr-repo add <name> <package.pkg.tar.zst>...\n"
+        "  pacmkr-repo remove <name> <package-name>...\n"
+        "  pacmkr-repo list\n"
+        "  pacmkr-repo delete <name>\n";
 }
 
 int run(const std::vector<std::string>& args) {
     try {
-        if (args.size() < 2 || args[1] == "help" || args[1] == "--help") {
+        if (args.empty() || args[0] == "help" || args[0] == "--help" || args[0] == "-h") {
             print_help();
-            return args.size() < 2 ? 1 : 0;
+            return args.empty() ? 1 : 0;
         }
         auto repos = load();
-        const auto& action = args[1];
+        const auto& action = args[0];
 
         if (action == "list") {
             for (const auto& [name, directory] : repos)
                 std::cout << name << "\t" << directory << "\n";
             return 0;
         }
-        if (args.size() < 3 || !valid_name(args[2]))
+        if (args.size() < 2 || !valid_name(args[1]))
             throw std::runtime_error("a valid repository name is required");
-        const auto& name = args[2];
+        const auto& name = args[1];
 
         if (action == "create") {
-            if (args.size() != 4) throw std::runtime_error("create requires a directory");
+            if (args.size() != 3) throw std::runtime_error("create requires a directory");
             if (repos.count(name)) throw std::runtime_error("repository already exists: " + name);
-            auto directory = std::filesystem::absolute(args[3]).lexically_normal();
+            auto directory = std::filesystem::absolute(args[2]).lexically_normal();
             std::filesystem::create_directories(directory);
             repos[name] = directory;
             save(repos);
@@ -119,18 +119,18 @@ int run(const std::vector<std::string>& args) {
         if (found == repos.end()) throw std::runtime_error("unknown repository: " + name);
 
         if (action == "delete") {
-            if (args.size() != 3) throw std::runtime_error("delete accepts only a name");
+            if (args.size() != 2) throw std::runtime_error("delete accepts only a name");
             repos.erase(found);
             save(repos);
             std::cout << "Unregistered " << name << " (files were preserved)\n";
             return 0;
         }
-        if ((action == "add" || action == "remove") && args.size() < 4)
+        if ((action == "add" || action == "remove") && args.size() < 3)
             throw std::runtime_error(action + " requires at least one package");
 
         if (action == "add") {
             std::vector<std::string> tool_args{database(name, found->second).string()};
-            for (auto it = args.begin() + 3; it != args.end(); ++it) {
+            for (auto it = args.begin() + 2; it != args.end(); ++it) {
                 auto source = std::filesystem::absolute(*it).lexically_normal();
                 if (!std::filesystem::is_regular_file(source))
                     throw std::runtime_error("package file not found: " + source.string());
@@ -153,7 +153,7 @@ int run(const std::vector<std::string>& args) {
         }
         if (action == "remove") {
             std::vector<std::string> tool_args{database(name, found->second).string()};
-            tool_args.insert(tool_args.end(), args.begin() + 3, args.end());
+            tool_args.insert(tool_args.end(), args.begin() + 2, args.end());
             return execute("repo-remove", tool_args);
         }
         throw std::runtime_error("unknown repo action: " + action);

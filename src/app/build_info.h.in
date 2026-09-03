@@ -1,0 +1,10 @@
+#pragma once
+
+namespace pacmkr::build_info {
+
+inline constexpr const char* compiler = "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@";
+inline constexpr const char* cxx_standard = "C++@CMAKE_CXX_STANDARD@";
+inline constexpr const char* build_type = "@CMAKE_BUILD_TYPE@";
+inline constexpr const char* compile_flags = "@PACMKR_EFFECTIVE_CXX_FLAGS@";
+
+} // namespace pacmkr::build_info

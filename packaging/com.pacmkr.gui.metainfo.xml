@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.pacmkr.gui</id>
+  <name>pacmkr</name>
+  <summary>Manage Arch Linux repository and AUR packages</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="com.pacmkr">
+    <name>pacmkr contributors</name>
+  </developer>
+  <description>
+    <p>pacmkr provides package search, update review, and optimized AUR builds in a GTK desktop interface.</p>
+  </description>
+  <launchable type="desktop-id">com.pacmkr.gui.desktop</launchable>
+  <url type="homepage">https://github.com/lseman/pacmkr</url>
+  <content_rating type="oars-1.1" />
+  <provides>
+    <binary>pacmkr-gui</binary>
+  </provides>
+  <categories>
+    <category>System</category>
+    <category>PackageManager</category>
+  </categories>
+</component>
