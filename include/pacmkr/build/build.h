@@ -24,9 +24,13 @@ struct BuildOrchestrator {
     /// Number of retries attempted (set by run()).
     int retries_attempted() const { return retries_; }
 
+    /// Total build duration in milliseconds (set by run()).
+    int total_duration_ms() const { return static_cast<int>(total_duration_.count()); }
+
 private:
     std::filesystem::path log_dir_{};
     int retries_{0};
+    std::chrono::milliseconds total_duration_;
     void setup_environment();
     int run_function(const std::string& func_name, const std::filesystem::path& srcdir,
                      const std::filesystem::path& pkgdir = {}, bool fakeroot = false);

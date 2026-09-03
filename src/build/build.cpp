@@ -73,6 +73,9 @@ int BuildOrchestrator::run() {
     auto srcdir = workdir / "src";
     auto pkgdir = workdir / "pkg";
 
+    // ─── Start build timer ───────────────────────────────────────
+    auto build_start = std::chrono::steady_clock::now();
+
     // ─── Set up build log directory ──────────────────────────────
     namespace fs = std::filesystem;
     const char* home = std::getenv("HOME");
@@ -180,6 +183,15 @@ int BuildOrchestrator::run() {
         alpm::install_files(paths, cli.noconfirm);
     }
 
+    // ─── Report build timing ─────────────────────────────────────
+    auto build_end = std::chrono::steady_clock::now();
+    total_duration_ = std::chrono::duration_cast<std::chrono::milliseconds>(build_end - build_start);
+    
+    int secs = total_duration_.count() / 1000;
+    int ms = total_duration_.count() % 1000;
+    std::cout << "==> Build completed in " << secs << "s" << (ms > 0 ? " +" + std::to_string(ms) + "ms" : "")
+              << (retries_ > 0 ? ", " + std::to_string(retries_) + " retry(ies)" : "") << "\n";
+    
     terminal::success("Build completed successfully");
     return 0;
 }

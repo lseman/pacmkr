@@ -132,6 +132,7 @@ void set_bool(Cli& cli, const std::string& flag, bool val) {
     else if (flag == "debug")            cli.debug = val;
     else if (flag == "json")             cli.json_output = val;
     else if (flag == "dry-run" || flag == "dryrun" || flag == "dry_run")  cli.dry_run = val;
+    else if (flag == "cleanup")           cli.cleanup = val;
     else if (flag == "color")            cli.color_flag = val;
     else if (flag == "nocolor")          cli.nocolor_flag = val;
     else if (flag == "all-deps")         cli.all_deps = val;
@@ -195,6 +196,7 @@ constexpr OptDef opts[] = {
     {"--build", "-B", false},
     {"--json", nullptr, false},
     {"--dry-run", nullptr, false},
+    {"--cleanup", nullptr, false},
 
     // AUR integration
     {"--aur", nullptr, false},
@@ -246,6 +248,7 @@ constexpr OptDef opts[] = {
 
     // Search options
     {"--sortby", nullptr, true},
+    {"--cleanup-age", nullptr, true},
 
     // Help & version
     {"--help", "-h", false},
@@ -533,6 +536,9 @@ Cli parse(int argc, char* argv[]) {
                         else if (sv == "popular") cli.sort_by = Cli::SortBy::Popular;
                         else cli.sort_by = Cli::SortBy::Votes;
                     }
+                    else if (lf == "cleanup-age") {
+                        try { cli.cleanup_age_days = static_cast<unsigned int>(std::stoul(value)); } catch (...) {}
+                    }
 
                     // Build workflow options
                     else if (lf == "answerclean")    cli.answer_clean = value;
@@ -640,6 +646,8 @@ void print_help() {
         "      --json                Machine-readable JSON output\n"
         "      --dry-run             Preview upgrade without executing\n"
         "  -Qm, --orphans            List foreign/orphan packages\n"
+        "      --cleanup             Remove old AUR sources and build logs\n"
+        "      --cleanup-age N       Age threshold in days (default: 30)\n"
         "\n"
         "Config:\n"
         "      --config FILE         Alternate config file\n"

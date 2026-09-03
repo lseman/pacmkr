@@ -166,6 +166,10 @@ struct Cli {
     bool json_output{false};              // --json: machine-readable JSON output
     bool dry_run{false};                  // --dry-run: preview without executing
 
+    // ─── Maintenance ──────────────────────────────────────────────
+    bool cleanup{false};                  // --cleanup: remove old AUR sources and build logs
+    unsigned int cleanup_age_days{30};    // --cleanup-age N: days threshold (default 30)
+
     // ─── Diagnostics ──────────────────────────────────────────────
     bool show_flags{false};               // --flags: print the flags used to build packages
 };

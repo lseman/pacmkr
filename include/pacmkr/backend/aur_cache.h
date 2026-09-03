@@ -68,4 +68,14 @@ std::filesystem::path cache_path();
 /// Force refresh the cache from the AUR API.
 void refresh();
 
+/// Cleanup structure for reporting results.
+struct CleanupStats {
+    std::uint64_t sources_removed{0};  // Number of source dirs removed
+    std::uint64_t logs_removed{0};     // Number of build log dirs removed
+    std::uint64_t bytes_freed{0};      // Approximate bytes freed
+};
+
+/// Remove AUR source directories and build logs older than `max_age_days`.
+CleanupStats cleanup_sources_and_logs(unsigned int max_age_days = 30);
+
 } // namespace pacmkr::aur_cache

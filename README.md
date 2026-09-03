@@ -120,6 +120,17 @@ by relevance, with repository packages breaking ties when scores are equal.
 pacmkr -Ss --json terminal | jq '.results[] | select(.source == "aur")'
 ```
 
+### Cache maintenance
+
+**AUR source cleanup**: `pacmkr --cleanup` removes AUR source directories and
+build logs older than N days (default 30). Use `--cleanup-age 7` to keep only
+the last week.
+
+```bash
+pacmkr --cleanup
+pacmkr --cleanup --cleanup-age 7  # Keep only 7 days
+```
+
 ### Build resilience
 
 **Disk space pre-check**: before invoking makepkg, pacmkr verifies that the
@@ -130,6 +141,10 @@ threshold by setting `min_space` in your config file.
 GPG keyring issues) are automatically retried up to 2 times with exponential
 backoff (1 s → 3 s → 9 s). Build logs for every attempt are saved under
 `~/.cache/pacmkr/logs/`.
+
+**Build time tracking**: each build reports total elapsed time at completion,
+along with the number of retries if any. This helps identify slow builds and
+tune optimization flags.
 
 **Dry-run upgrade preview**: `--dry-run` shows exactly what a `-Syu` would change
 — repository upgrades, AUR out-of-date packages, dependency resolution plan, and

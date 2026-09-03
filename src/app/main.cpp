@@ -1562,6 +1562,32 @@ int main(int argc, char* argv[]) {
             }
             alpm::shutdown();
             return 0;
+        } else if (cli.cleanup) {
+            // Cleanup old AUR sources and build logs
+            auto stats = aur_cache::cleanup_sources_and_logs(cli.cleanup_age_days);
+            std::cout << "==> Cleanup complete:\n";
+            std::cout << "  Sources removed: " << stats.sources_removed << "\n";
+            std::cout << "  Build logs removed: " << stats.logs_removed << "\n";
+            
+            // Format bytes freed
+            const char* units[] = {"B", "KB", "MB", "GB"};
+            int unit_idx = 0;
+            double size = static_cast<double>(stats.bytes_freed);
+            while (size >= 1024.0 && unit_idx < 3) {
+                size /= 1024.0;
+                ++unit_idx;
+            }
+            std::cout << "  Space freed: ";
+            if (unit_idx == 0) {
+                std::cout << static_cast<std::uint64_t>(stats.bytes_freed);
+            } else {
+                std::cout.precision(1);
+                std::cout << size;
+            }
+            std::cout << " " << units[unit_idx] << "\n";
+            
+            aur_cache::shutdown();
+            return 0;
         } else if (cli.build_local) {
             // Explicit local PKGBUILD build: --build / -B
             auto sys_config = config::Config::load(cli.config.empty() ? nullptr : &cli.config);

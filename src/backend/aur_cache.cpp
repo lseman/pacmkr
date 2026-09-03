@@ -365,4 +365,85 @@ void refresh() {
     init(true);
 }
 
+namespace {
+
+using namespace std::filesystem;
+
+/// Calculate age in days for a file/directory.
+static unsigned int age_in_days(const path& p) {
+    std::error_code ec;
+    auto ftime = last_write_time(p, ec);
+    if (ec) return 0;
+    
+    // Get current time as system_clock
+    auto now = std::chrono::system_clock::now();
+    
+    // Convert filesystem clock time_point to time_t, then to system_clock
+    auto ftime_sys = std::chrono::system_clock::from_time_t(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            ftime.time_since_epoch()).count());
+    
+    auto age = std::chrono::duration_cast<std::chrono::days>(now - ftime_sys);
+    return static_cast<unsigned int>(age.count());
+}
+
+/// Estimate size of a directory recursively.
+static std::uint64_t dir_size(const path& p) {
+    std::uint64_t total = 0;
+    std::error_code ec;
+    for (const auto& entry : recursive_directory_iterator(p, directory_options::skip_permission_denied, ec)) {
+        if (entry.is_regular_file()) {
+            total += entry.file_size(ec);
+        }
+    }
+    return total;
+}
+
+} // anonymous
+
+CleanupStats cleanup_sources_and_logs(unsigned int max_age_days) {
+    CleanupStats stats{};
+    
+    const char* home = std::getenv("HOME");
+    const path cache_base = home ? path(home) / ".cache" / "pacmkr" : temp_directory_path() / "pacmkr";
+    
+    // Clean AUR source directories
+    const path aur_dir = cache_base / "aur";
+    if (exists(aur_dir)) {
+        for (const auto& entry : std::filesystem::directory_iterator(aur_dir)) {
+            if (!entry.is_directory()) continue;
+            
+            unsigned int age = age_in_days(entry.path());
+            if (age > max_age_days) {
+                stats.bytes_freed += dir_size(entry.path());
+                std::error_code ec;
+                std::filesystem::remove_all(entry.path(), ec);
+                if (!ec) {
+                    stats.sources_removed++;
+                }
+            }
+        }
+    }
+    
+    // Clean build log directories
+    const path logs_dir = cache_base / "logs";
+    if (exists(logs_dir)) {
+        for (const auto& entry : std::filesystem::directory_iterator(logs_dir)) {
+            if (!entry.is_directory()) continue;
+            
+            unsigned int age = age_in_days(entry.path());
+            if (age > max_age_days) {
+                stats.bytes_freed += dir_size(entry.path());
+                std::error_code ec;
+                std::filesystem::remove_all(entry.path(), ec);
+                if (!ec) {
+                    stats.logs_removed++;
+                }
+            }
+        }
+    }
+    
+    return stats;
+}
+
 } // namespace pacmkr::aur_cache
