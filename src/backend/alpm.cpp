@@ -1253,6 +1253,9 @@ PendingUpgradeCheck check_pending_repo_upgrades(bool refresh) {
         for (const auto& repository : repositories) {
             auto* db = alpm_register_syncdb(check_handle, repository.name.c_str(), 0);
             if (!db) return result;
+            // Set usage flags so libalpm's sysupgrade logic recognizes this
+            // database — matching what the real handle does at init() time.
+            alpm_db_set_usage(db, repository_usage(repository.usage));
             add_servers_from_file(db, g_config_path, repository.name,
                                   g_registration_architecture, true);
 
@@ -1270,7 +1273,7 @@ PendingUpgradeCheck check_pending_repo_upgrades(bool refresh) {
         }
 
         auto* dbs = alpm_get_syncdbs(check_handle);
-        if (alpm_db_update(check_handle, dbs, 0) < 0) return result;
+        bool update_failed = alpm_db_update(check_handle, dbs, 0) < 0;
 
         auto* local = alpm_get_localdb(g_handle);
         for (auto* item = alpm_db_get_pkgcache(local); item; item = item->next) {
@@ -1295,7 +1298,10 @@ PendingUpgradeCheck check_pending_repo_upgrades(bool refresh) {
                 }
             }
         }
-        result.checked = true;
+        // If the refresh failed (e.g. one custom repo is unreachable),
+        // we still have whatever data was already seeded/cached, so
+        // treat it as a best-effort check rather than a total failure.
+        result.checked = !update_failed;
     } catch (...) {
         result.checked = false;
     }

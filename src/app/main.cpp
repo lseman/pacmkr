@@ -1298,38 +1298,13 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // A plain `-Syu`/`-Su` (no extra install/remove targets) shouldn't ask
-    // for a password unless there's actually something to upgrade — mirror
-    // pacman-contrib's `checkupdates` and yay: check for pending work first,
-    // without ever touching anything that needs root, and only escalate
-    // once we know there's a real transaction to run. A `--dry-run` preview
-    // never mutates the system either way, so it never needs root.
+    // A real sync upgrade always refreshes and runs against the system
+    // databases, so authorize before starting it even when a preliminary
+    // check might appear current. An explicit dry-run never mutates them.
     bool skip_sync_upgrade_reexec = false;
     if (geteuid() != 0 && alpm::uses_system_root() && operations::is_sync_upgrade(raw_args)) {
         try {
-            auto precheck_cli = cli::parse(argc, argv);
-            if (precheck_cli.dry_run) {
-                skip_sync_upgrade_reexec = true;
-            } else if (precheck_cli.packages.empty()) {
-                aur_cache::init();
-                auto ootd_future = deps::detect_out_of_date_async();
-                auto repo_check = alpm::check_pending_repo_upgrades(precheck_cli.refresh_db);
-
-                std::vector<deps::OutOfDatePkg> ootd;
-                try { ootd = ootd_future.get(); } catch (...) {}
-                if (precheck_cli.nodevel) {
-                    ootd.erase(std::remove_if(ootd.begin(), ootd.end(),
-                        [](const deps::OutOfDatePkg& p) { return deps::is_dev_package(p.name); }),
-                        ootd.end());
-                }
-
-                if (repo_check.checked && repo_check.upgrades.empty() && ootd.empty()) {
-                    terminal::success("Everything is already up to date");
-                    alpm::shutdown();
-                    aur_cache::shutdown();
-                    return 0;
-                }
-            }
+            skip_sync_upgrade_reexec = cli::parse(argc, argv).dry_run;
         } catch (const std::exception&) {
             // Leave skip_sync_upgrade_reexec false; the normal path below
             // re-parses and reports the error properly.
