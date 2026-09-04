@@ -32,6 +32,14 @@ static std::vector<std::string> g_hold_packages;
 static std::mutex g_warning_mutex;
 static std::unordered_set<std::string> g_emitted_warnings;
 
+// Repository configuration captured at init() time, kept around so a
+// root-free upgrade check (see check_pending_repo_upgrades) can stand up its
+// own throwaway handle with the same repositories/servers without having to
+// re-run root-only setup.
+static std::string g_config_path;
+static std::vector<pacman_config::Repository> g_repositories;
+static std::string g_registration_architecture;
+
 static void clear_emitted_warnings() {
     std::lock_guard<std::mutex> lock(g_warning_mutex);
     g_emitted_warnings.clear();
@@ -598,7 +606,7 @@ void init(const std::string& root, const std::string& db_path, const std::string
     const auto normalized_arch = trim_check(arch_value);
     if (normalized_arch.empty() || normalized_arch == "auto" ||
         normalized_arch.find("auto") != std::string::npos) {
-        for (auto* item = alpm_option_get_physical_architectures(g_handle);
+        for (auto* item = alpm_option_get_architectures(g_handle);
              item; item = item->next) {
             if (item->data) architectures.emplace_back(static_cast<char*>(item->data));
         }
@@ -664,11 +672,18 @@ void init(const std::string& root, const std::string& db_path, const std::string
             throw alpm_error(last_error("cannot set repository usage for " + repository.name));
         add_servers_from_file(db, config_path, repository.name, architecture, true);
     }
+
+    g_config_path = config_path;
+    g_repositories = repositories;
+    g_registration_architecture = architecture;
 }
 
 void shutdown() {
     if (g_handle) { alpm_release(g_handle); g_handle = nullptr; }
     g_hold_packages.clear();
+    g_config_path.clear();
+    g_repositories.clear();
+    g_registration_architecture.clear();
 }
 
 void set_log_callback(std::function<void(int, const char*)> cb) {
@@ -1163,6 +1178,126 @@ std::vector<OutOfDatePkg> get_upgrades() {
             ood.repo_version    = sync_pkg->version;
             result.push_back(std::move(ood));
         }
+    }
+    return result;
+}
+
+PendingUpgradeCheck check_pending_repo_upgrades(bool refresh) {
+    PendingUpgradeCheck result;
+    if (!g_handle) return result;
+
+    // No refresh requested: the already-synced databases are plain,
+    // world-readable files, so this is just get_upgrades() with no
+    // privilege of any kind involved.
+    if (!refresh) {
+        try {
+            result.upgrades = get_upgrades();
+            result.checked = true;
+        } catch (...) {}
+        return result;
+    }
+
+    if (geteuid() == 0) {
+        // Already root: no need for the unprivileged dance.
+        try {
+            if (refresh_databases() == 0) {
+                result.upgrades = get_upgrades();
+                result.checked = true;
+            }
+        } catch (...) {}
+        return result;
+    }
+
+    namespace fs = std::filesystem;
+    try {
+        const char* real_dbpath_c = alpm_option_get_dbpath(g_handle);
+        if (!real_dbpath_c || g_config_path.empty()) return result;
+        const fs::path real_sync_dir = fs::path(real_dbpath_c) / "sync";
+
+        // A fixed, per-user scratch dbpath keyed to the real one: reusing it
+        // across invocations means each check after the first is a cheap
+        // conditional GET, the same trick pacman-contrib's checkupdates
+        // uses. Keying on the real dbpath too (rather than just uid) keeps
+        // an alternate root/dbpath (tests, chroots) from ever reusing a
+        // stale cache seeded from a different install.
+        const fs::path temp_dbpath =
+            fs::temp_directory_path() /
+            ("pacmkr-checkdb-" + std::to_string(getuid()) + "-" +
+             std::to_string(std::hash<std::string>{}(real_dbpath_c)));
+        const fs::path temp_sync_dir = temp_dbpath / "sync";
+        std::error_code ec;
+        fs::create_directories(temp_sync_dir, ec);
+        if (ec) return result;
+
+        alpm_handle_t* check_handle = alpm_initialize("/", temp_dbpath.c_str(), nullptr);
+        if (!check_handle) return result;
+        struct HandleGuard {
+            alpm_handle_t* handle;
+            ~HandleGuard() { if (handle) alpm_release(handle); }
+        } guard{check_handle};
+
+        // Nothing here is installed and the real sync is re-verified with
+        // full signature checking later when the privileged upgrade actually
+        // runs, so skip signature checking for this throwaway handle: the
+        // system keyring under /etc/pacman.d/gnupg is root-only anyway.
+        alpm_option_set_default_siglevel(check_handle, 0);
+
+        auto repositories = g_repositories;
+        if (repositories.empty()) {
+            repositories = {
+                {"core", {}, {"All"}},
+                {"extra", {}, {"All"}},
+                {"multilib", {}, {"All"}},
+            };
+        }
+        for (const auto& repository : repositories) {
+            auto* db = alpm_register_syncdb(check_handle, repository.name.c_str(), 0);
+            if (!db) return result;
+            add_servers_from_file(db, g_config_path, repository.name,
+                                  g_registration_architecture, true);
+
+            // Seed from the real, already-downloaded database (if any) so
+            // alpm_db_update performs a conditional re-download instead of
+            // fetching the whole thing again — and so it only ever writes
+            // into our private, user-owned temp_sync_dir, never touching
+            // the real root-owned sync directory it's seeded from.
+            for (const char* ext : {".db", ".db.sig"}) {
+                const fs::path real_file = real_sync_dir / (repository.name + ext);
+                const fs::path temp_file = temp_sync_dir / (repository.name + ext);
+                if (fs::exists(temp_file, ec)) continue;
+                if (fs::exists(real_file, ec)) fs::create_symlink(real_file, temp_file, ec);
+            }
+        }
+
+        auto* dbs = alpm_get_syncdbs(check_handle);
+        if (alpm_db_update(check_handle, dbs, 0) < 0) return result;
+
+        auto* local = alpm_get_localdb(g_handle);
+        for (auto* item = alpm_db_get_pkgcache(local); item; item = item->next) {
+            auto* lpkg = static_cast<alpm_pkg_t*>(item->data);
+            const char* name = lpkg ? alpm_pkg_get_name(lpkg) : nullptr;
+            const char* lver = lpkg ? alpm_pkg_get_version(lpkg) : nullptr;
+            if (!name || !lver) continue;
+            if (std::find(g_hold_packages.begin(), g_hold_packages.end(), name) !=
+                g_hold_packages.end())
+                continue;
+
+            for (auto* db_item = dbs; db_item; db_item = db_item->next) {
+                auto* db = static_cast<alpm_db_t*>(db_item->data);
+                auto* spkg = db ? alpm_db_get_pkg(db, name) : nullptr;
+                if (spkg && alpm_pkg_vercmp(lver, alpm_pkg_get_version(spkg)) < 0) {
+                    OutOfDatePkg ood{};
+                    ood.name = name;
+                    ood.installed_version = lver;
+                    ood.repo_version = alpm_pkg_get_version(spkg);
+                    result.upgrades.push_back(std::move(ood));
+                    break;
+                }
+            }
+        }
+        result.checked = true;
+    } catch (...) {
+        result.checked = false;
     }
     return result;
 }
