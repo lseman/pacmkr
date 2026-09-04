@@ -98,6 +98,20 @@ std::vector<FileMatch> search_sync_files(const std::string& query);
 /// Return dependency expressions not satisfied by the installed database.
 std::vector<std::string> missing_dependencies(const std::vector<std::string>& dependencies);
 
+/// Compare two version strings with libalpm's canonical algorithm
+/// (handles epoch, pkgrel, tilde, and keyword ordering). Result is
+/// normalized to -1 (a < b), 0 (a == b), or 1 (a > b).
+int vercmp(const std::string& a, const std::string& b);
+
+/// Name of an installed package satisfying `dep_spec` (a dependency string
+/// that may carry a version constraint, e.g. "foo>=1.2"), or nullopt.
+/// Honors `provides` and version constraints exactly as pacman does.
+std::optional<std::string> local_satisfier(const std::string& dep_spec);
+
+/// Name of a sync-repo package satisfying `dep_spec`, honoring `provides`
+/// and version constraints, or nullopt.
+std::optional<std::string> sync_satisfier(const std::string& dep_spec);
+
 /// Change the install reason stored in the local package database.
 int set_install_reason(const std::vector<std::string>& packages, bool explicit_reason);
 
@@ -163,6 +177,12 @@ int download(const std::vector<std::string>& packages, bool sysupgrade = false,
 /// Install package archives produced locally (for example AUR builds).
 /// Entries containing "://" are downloaded to the package cache first (for -U <url>).
 int install_files(const std::vector<std::string>& paths, bool no_confirm = false);
+
+/// Install missing build dependencies (makedepends/checkdepends) from sync repos.
+/// Filters out already-installed packages and installs only what's needed.
+int install_sync_packages(const std::vector<std::string>& makedeps,
+                          const std::vector<std::string>& checkdeps,
+                          bool no_confirm = false);
 
 /// Read package metadata straight from a .pkg.tar archive (for -Qp).
 /// Throws if the file cannot be loaded. Populates Package::files.

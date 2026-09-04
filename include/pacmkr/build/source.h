@@ -11,8 +11,10 @@ namespace pacmkr::source {
 struct SourceHandler {
     std::filesystem::path srcdest;
     bool skip_checksums{false};
+    bool hold_version{false};
 
-    SourceHandler(const std::filesystem::path& srcdest, bool skip_checksums = false);
+    SourceHandler(const std::filesystem::path& srcdest, bool skip_checksums = false,
+                  bool hold_version = false);
 
     /// Download all sources and verify checksums.
     void download_and_verify(const pkgbuild::Pkgbuild& pkgbuild,

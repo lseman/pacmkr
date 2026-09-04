@@ -1,0 +1,321 @@
+.TH PACMKR 1 "2026-09-03" "pacmkr 0.1.0" "pacmkr Manual"
+.SH NAME
+pacmkr \- fast package manager and AUR helper for Arch Linux
+.SH SYNOPSIS
+.B pacmkr
+.RI [ operation ]
+.RI [ options ]
+.RI [ targets ...]
+.br
+.B pacmkr \-\-build
+.RI [ options ]
+.SH DESCRIPTION
+.B pacmkr
+brings official repository and AUR workflows into a single command\-line tool.
+Repository reads and privileged system transactions go through
+.BR libalpm (3)
+directly; AUR packages are resolved in dependency order, built from their
+PKGBUILDs, and handed back to libalpm for installation.
+.PP
+The operation selectors mirror
+.BR pacman (8):
+clustered short forms such as
+.BR \-Syu ", " \-Ss ", " \-Qi ", and " \-Rns
+work as they do there. Options that are specific to pacmkr \(em AUR
+integration, build optimization, and local build control \(em are described
+below.
+.SH OPERATIONS
+.TP
+.BR \-S ", " \-\-sync
+Synchronize packages. Install named targets, searching official repositories
+first and falling back to the AUR. Sub\-forms:
+.BR \-Sy " refresh databases, "
+.BR \-Su " upgrade, "
+.BR \-Ss " search, "
+.BR \-Si " info, "
+.BR \-Sl " list a repository, "
+.BR \-Sw " download only, "
+.BR \-Sc / \-Scc " clean the package cache."
+.TP
+.BR \-R ", " \-\-remove
+Remove packages.
+.BR \-Rs " also removes now\-unneeded dependencies, "
+.BR \-Rn " skips saving "
+.RB backup ( .pacsave )
+files,
+.BR \-Rc " removes packages that depend on the target, and "
+.BR \-Rns " combines the common case."
+.TP
+.BR \-Q ", " \-\-query
+Query the local database.
+.BR \-Qi " info, "
+.BR \-Ql " file list, "
+.BR \-Qo " owning package for a path, "
+.BR \-Qe " explicitly installed, "
+.BR \-Qu " upgradable, "
+.BR \-Qm " foreign (AUR/local) packages, "
+.BR \-Qs " search, "
+.BR \-Qc " changelog, "
+.BR \-Qp " read from a package file."
+.TP
+.BR \-U ", " \-\-upgrade
+Install a package from a local file or an
+.IR http(s):// " URL."
+.TP
+.BR \-F ", " \-\-files
+Query the file database
+.RB ( \-Fs " search, " \-Fl " list, " \-Fi " info)."
+.TP
+.BR \-D ", " \-\-database
+Change the recorded install reason
+.RB ( \-\-asdeps ", " \-\-asexplicit ).
+.TP
+.BR \-T ", " \-\-deptest
+Print the given dependency expressions that are not currently satisfied.
+.TP
+.BR \-B ", " \-\-build
+Build the
+.B PKGBUILD
+in the current directory (see
+.B LOCAL BUILD
+below).
+.TP
+.B \-\-list\-foreign
+List installed packages absent from every configured repository
+(equivalent to
+.BR \-Qm ).
+.SH AUR OPTIONS
+.TP
+.B \-\-aur
+Restrict the operation to the AUR instead of consulting repositories first.
+.TP
+.B \-\-aur\-deps
+Resolve the target's transitive AUR dependencies and build them in
+topological order before the target. Dependencies already satisfied by an
+installed or repository package \(em including via
+.I provides
+and version constraints \(em are skipped; virtual dependencies are resolved
+to a real AUR provider.
+.TP
+.B \-\-noreview
+Explicitly skip inspection of changed AUR files. By default pacmkr shows the
+complete Git diff since the last approved commit and requires approval before
+any PKGBUILD is executed. Unlike general transaction prompts,
+.B \-\-noconfirm
+does not bypass this trust decision.
+.TP
+.BI \-\-search " QUERY"
+Search the AUR and print ranked results.
+.TP
+.BI \-\-limit " N"
+Cap the number of search results shown.
+.TP
+.BI \-\-aur\-dir " DIR"
+Directory for AUR git clones and build trees. Defaults to
+.IR ~/.cache/pacmkr/aur .
+.TP
+.BR \-u ", " \-\-refresh
+When combined with a sync upgrade, also rebuild installed foreign packages
+whose AUR version is newer.
+.TP
+.BR \-\-devel ", " \-\-nodevel
+Include or exclude
+.RB \-git ", " \-svn ", " \-hg
+and similar development packages from upgrade consideration.
+.TP
+.BR \-G ", " \-\-getpkgbuild
+Download a package's PKGBUILD and supporting files without building.
+.TP
+.B \-\-orphans
+List packages installed as dependencies that nothing now requires.
+.TP
+.BR \-\-cleanup ", " \-\-cleanup\-age " " \fIN\fR
+Remove AUR source directories and build logs older than
+.I N
+days (default 30).
+.TP
+.BI \-\-sortby " KEY"
+Ordering for search results:
+.BR votes ", " popular ", or " updated .
+.TP
+.B \-\-pgpfetch
+Automatically retrieve missing PKGBUILD PGP keys from a keyserver.
+.TP
+.BR \-\-keepsrc ", " \-\-cleanafter
+Keep source trees after a build, or delete each package's build directory
+once it is installed.
+.SH BUILD OPTIMIZATION
+These flags apply only to packages that pacmkr builds, never to prebuilt
+repository packages. Each takes an optional mode argument
+.RB ( yes ", " no ", " auto ).
+.TP
+.BI \-\-lto " MODE"
+Enable link\-time optimization
+.RB ( \-flto ).
+.TP
+.BI \-\-mold " MODE"
+Link with
+.BR mold .
+.TP
+.BI \-\-graphite " MODE"
+Enable the GCC Graphite loop optimizer.
+.TP
+.BI \-\-polly " MODE"
+Enable the LLVM Polly optimizer.
+.TP
+.BI \-\-cc " COMPILER"
+Force
+.B gcc
+or
+.BR clang .
+.TP
+.BI \-\-mflags " FLAGS"
+Extra flags passed through to the build (for example
+.BR "\-\-mflags=\(dq\-j8\(dq" ).
+.SH LOCAL BUILD
+With
+.B \-\-build
+(or when a PKGBUILD path is given) pacmkr runs its own PKGBUILD\-compatible
+pipeline without delegating the build to makepkg. It evaluates metadata with
+Bash semantics, downloads and verifies sources, updates VCS versions through
+.BR pkgver() ,
+then runs
+.BR prepare() ", " build() ", " check() ", and " package() .
+Split-package overrides are captured after each
+.BR package_*() ,
+including package-specific dependencies, descriptions, architectures,
+install scripts, and changelogs. Native archives contain
+.B .PKGINFO,
+.B .BUILDINFO,
+and a compressed
+.B .MTREE;
+setting
+.B SOURCE_DATE_EPOCH
+makes timestamps deterministic.
+Relevant makepkg\-style options include
+.BR \-p / \-\-packagefile ", "
+.BR \-C / \-\-cleanbuild ", "
+.BR \-f / \-\-force ", "
+.BR \-i / \-\-install ", "
+.BR \-\-nocheck ", "
+.BR \-\-noprepare ", "
+.BR \-\-verifysource ", "
+.BR \-\-skipchecksums ", "
+.BR \-\-sign ", "
+.BR \-r / \-\-rmdeps ", and "
+.BR \-\-printsrcinfo .
+Build logs for every attempt are written under
+.IR ~/.cache/pacmkr/logs/ .
+.SH TRANSACTION OPTIONS
+.TP
+.B \-\-needed
+Do not reinstall targets that are already up to date.
+.TP
+.BI \-\-ignore " PACKAGE"
+.TQ
+.BI \-\-ignoregroup " GROUP"
+Skip the named package or group during an upgrade. May be repeated.
+.TP
+.BI \-\-overwrite " GLOB"
+Overwrite files that would otherwise conflict. May be repeated.
+.TP
+.BR \-w ", " \-\-downloadonly
+Download packages into the cache without installing.
+.TP
+.BR \-n ", " \-\-noconfirm
+Assume the default answer to transaction prompts. AUR file review still
+requires explicit approval unless
+.B \-\-noreview
+is supplied.
+.TP
+.B \-\-dry\-run
+With a sync upgrade, print exactly what would change \(em repository
+upgrades, out\-of\-date AUR packages, the resolved build plan, and any
+conflicts \(em without touching the system.
+.SH OUTPUT OPTIONS
+.TP
+.B \-\-json
+Emit machine\-readable JSON for searches, info, and upgrade previews.
+.TP
+.BR \-\-color ", " \-\-nocolor
+Force or disable ANSI color regardless of whether stdout is a terminal.
+.TP
+.BR \-h ", " \-\-help
+Print the full option reference.
+.TP
+.BR \-V ", " \-\-version
+Print the version.
+.TP
+.B \-\-flags
+Print the compiler and flags pacmkr would use to build packages.
+.SH ENVIRONMENT
+.TP
+.B HOME
+Base for the cache
+.RI ( ~/.cache/pacmkr )
+and config
+.RI ( ~/.config/pacmkr/config )
+directories.
+.TP
+.BR CFLAGS ", " CXXFLAGS ", " LDFLAGS ", " MAKEFLAGS
+Honored as build baselines; optimization flags are layered on top.
+.PP
+Any trailing
+.B KEY=VALUE
+arguments after a
+.B \-\-
+separator are exported into the build environment.
+.SH FILES
+.TP
+.I ~/.config/pacmkr/config
+Persistent defaults in
+.BR key\ =\ value
+form. See
+.B config.example
+in the distribution.
+.TP
+.I ~/.cache/pacmkr/aur
+Default AUR clone and build directory.
+.TP
+.I ~/.cache/pacmkr/logs
+Per\-build log directories, each with a
+.B manifest.json
+and one log file per build function.
+.TP
+.I /etc/pacman.conf
+Read for repositories, architecture, cache directories, signature levels, and
+.BR ParallelDownloads .
+.SH EXIT STATUS
+.B pacmkr
+exits
+.B 0
+on success and non\-zero when an operation, build, or transaction fails.
+.SH EXAMPLES
+.TP
+Full system upgrade, repositories and AUR:
+.B sudo pacmkr \-Syu
+.TP
+Search repositories and the AUR together:
+.B pacmkr \-Ss terminal
+.TP
+Build an AUR package with its AUR dependencies:
+.B pacmkr \-\-aur \-\-aur\-deps \fIpackage\fR
+.TP
+Preview an upgrade:
+.B pacmkr \-\-dry\-run \-Syu
+.TP
+Build the current directory with mold and LTO:
+.B pacmkr \-\-build \-\-mold \-\-lto
+.SH SEE ALSO
+.BR pacman (8),
+.BR makepkg (8),
+.BR PKGBUILD (5),
+.BR pacman.conf (5),
+.BR vercmp (8),
+.BR pacmkr\-repo (1)
+.SH BUGS
+pacmkr is experimental. Review package transactions and PKGBUILDs before
+installing, and keep an independent recovery path on critical systems.
+Report issues at
+.UR https://github.com/lseman/pacmkr
+.UE .

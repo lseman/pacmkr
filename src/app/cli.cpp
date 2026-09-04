@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -125,6 +126,7 @@ void set_bool(Cli& cli, const std::string& flag, bool val) {
     else if (flag == "add")              cli.add = val;
     else if (flag == "aur")              cli.aur = val;
     else if (flag == "aur-deps")         cli.aur_deps = val;
+    else if (flag == "noreview")         cli.no_review = val;
     else if (flag == "refresh")          cli.refresh = val;
     else if (flag == "no-deps-resolve")  cli.no_deps_resolve = val;
     else if (flag == "nodownload")       cli.nodownload = val;
@@ -201,6 +203,7 @@ constexpr OptDef opts[] = {
     // AUR integration
     {"--aur", nullptr, false},
     {"--aur-deps", nullptr, false},
+    {"--noreview", nullptr, false},
     {"--search", nullptr, true},
     {"--limit", nullptr, true},
     {"--aur-dir", nullptr, true},
@@ -318,10 +321,6 @@ Cli parse(int argc, char* argv[]) {
     Cli cli{};
     std::vector<std::string> packages;
 
-    auto is_opt = [](const std::string& s) -> bool {
-        return detail::starts_with(s, "--") || (s.size() >= 2 && s[0] == '-');
-    };
-
     size_t i = 1;
     while (i < static_cast<size_t>(argc)) {
         auto arg = argv[i];
@@ -385,15 +384,13 @@ Cli parse(int argc, char* argv[]) {
             // Special handling for -S* clusters (sync operations)
             if (primary == 'S') {
                 cli.operation = Cli::Op::Sync;
-                bool has_action = false;
                 for (size_t k = 2; k < sarg.size(); ++k) {
                     char c = sarg[k];
                     if (apply_short_flag(cli, c, sync_flags, std::size(sync_flags))) {
-                        has_action = true;
+                        continue;
                     } else if (c == 'c') {
                         // -Sc or -Scc
                         cli.sync_clean = true;
-                        has_action = true;
                         if (k + 1 < sarg.size() && sarg[k + 1] == 'c') ++k;
                     } else {
                         // Unknown char in -S cluster — treat as package name
@@ -407,12 +404,9 @@ Cli parse(int argc, char* argv[]) {
             // Special handling for -F* clusters (files operations)
             if (primary == 'F') {
                 cli.operation = Cli::Op::Files;
-                bool has_action = false;
                 for (size_t k = 2; k < sarg.size(); ++k) {
                     char c = sarg[k];
-                    if (apply_short_flag(cli, c, files_flags, std::size(files_flags))) {
-                        has_action = true;
-                    } else {
+                    if (!apply_short_flag(cli, c, files_flags, std::size(files_flags))) {
                         packages.push_back(std::string(1, c));
                     }
                 }
@@ -423,12 +417,9 @@ Cli parse(int argc, char* argv[]) {
             // Special handling for -D* clusters (database operations)
             if (primary == 'D') {
                 cli.operation = Cli::Op::Database;
-                bool has_action = false;
                 for (size_t k = 2; k < sarg.size(); ++k) {
                     char c = sarg[k];
-                    if (apply_short_flag(cli, c, database_flags, std::size(database_flags))) {
-                        has_action = true;
-                    } else {
+                    if (!apply_short_flag(cli, c, database_flags, std::size(database_flags))) {
                         packages.push_back(std::string(1, c));
                     }
                 }
@@ -518,7 +509,13 @@ Cli parse(int argc, char* argv[]) {
                     else if (lf == "ignoregroup") cli.ignoregroup.push_back(value);
                     else if (lf == "overwrite") cli.overwrite.push_back(value);
                     else if (lf == "search") cli.search = value;
-                    else if (lf == "limit")  { try { cli.limit = std::stoul(value); } catch (...) {} }
+                    else if (lf == "limit")  {
+                        try {
+                            const auto parsed = std::stoul(value);
+                            if (parsed <= std::numeric_limits<unsigned int>::max())
+                                cli.limit = static_cast<unsigned int>(parsed);
+                        } catch (...) {}
+                    }
                     else if (lf == "aur-dir") cli.aur_dir = value;
                     else if (lf == "mflags") {
                         // Split mflags by whitespace
@@ -624,6 +621,7 @@ void print_help() {
         "AUR Integration:\n"
         "      --aur                 Build package from AUR\n"
         "      --aur-deps            Auto-resolve and build AUR dependencies\n"
+        "      --noreview            Explicitly skip review of AUR file changes\n"
         "      --search QUERY        Search AUR packages\n"
         "      --limit N             Limit search results (default: 10)\n"
         "      --aur-dir DIR         AUR clone directory (default: ./aur)\n"
@@ -633,7 +631,7 @@ void print_help() {
         "  -B, --build               Build PKGBUILD in current directory\n"
         "\n"
         "Build Options:\n"
-        "      --mflags FLAGS        Pass custom flags to makepkg (e.g., --mflags=\"-j8\")\n"
+        "      --mflags FLAGS        Set build-tool parallelism (e.g., --mflags=\"-j8\")\n"
         "      --nodevel             Skip dev/-git packages in upgrades\n"
         "      --devel               Include dev/-git packages in upgrades\n"
         "      --answerclean TEXT    Answer for clean build directory conflicts\n"
@@ -654,7 +652,7 @@ void print_help() {
         "  -n, --noconfirm           Skip all confirmation prompts\n"
         "      --color               Force color output\n"
         "      --nocolor             Disable color output\n"
-        "  -- <KEY=VALUE...>         Extra environment variables for makepkg\n"
+        "  -- <KEY=VALUE...>         Extra environment variables for the build\n"
         "\n"
         "Examples:\n"
         "  pacmkr-repo --help             Manage a custom/local repository\n"

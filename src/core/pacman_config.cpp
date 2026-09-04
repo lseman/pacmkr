@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <unordered_set>
 #include <sstream>
 
@@ -41,7 +42,7 @@ Config parse(std::istream& input) {
                 const auto found = std::find_if(config.repositories.begin(), config.repositories.end(),
                     [&](const Repository& repo) { return repo.name == section; });
                 if (found == config.repositories.end())
-                    config.repositories.push_back(Repository{section});
+                    config.repositories.push_back(Repository{section, {}, {"All"}});
             }
             continue;
         }
@@ -65,7 +66,13 @@ Config parse(std::istream& input) {
         else if (key == "GPGDir") result.gpg_dir = value;
         else if (key == "Architecture") result.architecture = value;
         else if (key == "DownloadUser") result.download_user = value;
-        else if (key == "ParallelDownloads") { try { result.parallel_downloads = std::stoul(value); } catch (...) {} }
+        else if (key == "ParallelDownloads") {
+            try {
+                const auto parsed = std::stoul(value);
+                if (parsed <= std::numeric_limits<unsigned int>::max())
+                    result.parallel_downloads = static_cast<unsigned int>(parsed);
+            } catch (...) {}
+        }
         else if (key == "CheckSpace") result.check_space = true;
         else if (key == "HoldPkg") { auto v = words(value); result.hold_packages.insert(result.hold_packages.end(), v.begin(), v.end()); }
         else if (key == "IgnorePkg") { auto v = words(value); result.ignore_packages.insert(result.ignore_packages.end(), v.begin(), v.end()); }

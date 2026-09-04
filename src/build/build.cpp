@@ -1,18 +1,17 @@
 #include "pacmkr/build/build.h"
 #include "pacmkr/core/optimize.h"
 #include "pacmkr/core/disk.h"
-#include "pacmkr/build/source.h"
 #include "pacmkr/core/error.h"
-#include "pacmkr/core/package.h"
 #include "pacmkr/backend/alpm.h"
 #include "pacmkr/app/terminal.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <queue>
 #include <sstream>
 #include <thread>
 #include <atomic>
@@ -31,21 +30,12 @@ bool check_tool(const std::string& name) {
     return optimize::find_tool(name).has_value();
 }
 
-int sign_archive(const std::filesystem::path& archive, const std::optional<std::string>& key) {
-    const pid_t child = fork();
-    if (child < 0) throw package_error("cannot create signing process");
-    if (child == 0) {
-        if (key)
-            execlp("gpg", "gpg", "--batch", "--yes", "--detach-sign", "--local-user",
-                   key->c_str(), archive.c_str(), static_cast<char*>(nullptr));
-        else
-            execlp("gpg", "gpg", "--batch", "--yes", "--detach-sign",
-                   archive.c_str(), static_cast<char*>(nullptr));
-        _exit(127);
-    }
-    int status = 0;
-    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 128;
+bool valid_environment_name(const std::string& name) {
+    if (name.empty() || (!std::isalpha(static_cast<unsigned char>(name.front())) &&
+                         name.front() != '_')) return false;
+    return std::all_of(name.begin() + 1, name.end(), [](unsigned char character) {
+        return std::isalnum(character) != 0 || character == '_';
+    });
 }
 
 } // anonymous
@@ -63,23 +53,19 @@ BuildOrchestrator::BuildOrchestrator(const cli::Cli& cli, const config::Config& 
                                       pkgbuild::Pkgbuild pkgbuild)
     : cli(cli), config(config), pkgbuild(std::move(pkgbuild)) {}
 
-// Maximum number of retries for a single build function.
-static constexpr int kMaxRetries = 2;
-// Base delay in milliseconds for exponential backoff.
-static constexpr int kBaseRetryMs = 1000;
-
 int BuildOrchestrator::run() {
     auto workdir = std::filesystem::current_path();
-    auto srcdir = workdir / "src";
-    auto pkgdir = workdir / "pkg";
 
     // ─── Start build timer ───────────────────────────────────────
     auto build_start = std::chrono::steady_clock::now();
 
     // ─── Set up build log directory ──────────────────────────────
     namespace fs = std::filesystem;
+    const char* xdg_cache = std::getenv("XDG_CACHE_HOME");
     const char* home = std::getenv("HOME");
-    const fs::path cache_base = home ? fs::path(home) / ".cache" / "pacmkr" : fs::temp_directory_path() / "pacmkr";
+    const fs::path cache_base = xdg_cache ? fs::path(xdg_cache) / "pacmkr"
+        : (home ? fs::path(home) / ".cache" / "pacmkr"
+                : fs::temp_directory_path() / "pacmkr");
     const fs::path logs_dir = cache_base / "logs";
     const std::string ts = pkgbuild.pkgbase() + "-" +
         std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
@@ -107,80 +93,89 @@ int BuildOrchestrator::run() {
     terminal::section("Build: " + pkgbuild.pkgbase());
     terminal::info("Log: " + log_dir_.string());
 
-    // Clean if requested
-    if (cli.cleanbuild && std::filesystem::exists(srcdir)) {
-        std::cout << "==> Removing existing $srcdir/ directory...\n";
-        std::filesystem::remove_all(srcdir);
-    }
-
-    if (cli.force && std::filesystem::exists(pkgdir)) {
-        std::cout << "==> Removing existing $pkgdir/ directory...\n";
-        std::filesystem::remove_all(pkgdir);
-    }
-
-    // Create working directories
-    std::filesystem::create_directories(srcdir);
-    std::filesystem::create_directories(pkgdir);
-
-    // Set up environment with optimization flags
-    setup_environment();
-
-    if (!cli.noextract) {
-        source::SourceHandler sources{config.srcdest, cli.skipchecksums || cli.skipinteg};
-        sources.download_and_verify(pkgbuild, srcdir);
-    }
-    if (cli.verifysource || cli.nobuild) return 0;
-
-    // Run prepare() if present and not skipped (with retry)
-    if (!cli.noprepare && pkgbuild.has_function("prepare")) {
-        if (run_with_retry("prepare", srcdir) != 0) return 1;
-    }
-
-    // Run build() if present (with retry)
-    if (pkgbuild.has_function("build")) {
-        if (run_with_retry("build", srcdir) != 0) return 1;
-    }
-
-    // Run check() if requested (with retry)
-    if ((cli.check || !cli.nocheck) && pkgbuild.has_function("check")) {
-        if (run_with_retry("check", srcdir) != 0) return 1;
-    }
-
-    std::vector<std::filesystem::path> archives;
-    const auto destination = std::filesystem::absolute(config.pkgdest);
-    std::filesystem::create_directories(destination);
-
-    // ─── Disk space pre-check ────────────────────────────────────
-    std::cout << "==> Checking disk space...\n";
-    disk::report_disk_status(workdir, destination);
-    if (!disk::check_space(workdir)) {
-        std::cerr << "error: aborting build due to insufficient disk space\n";
-        return 1;
-    }
-
-    for (const auto& name : pkgbuild.pkgname) {
-        std::filesystem::remove_all(pkgdir);
-        std::filesystem::create_directories(pkgdir);
-        const std::string function = pkgbuild.has_function("package_" + name) ? "package_" + name : "package";
-        if (!pkgbuild.has_function(function)) throw package_error("PKGBUILD has no " + function + "() function");
-        if (run_with_retry(function, srcdir, pkgdir, true) != 0) return 1;
-        const std::string arch = pkgbuild.arch.empty() ? "any" : pkgbuild.arch.front();
-        auto output = package::Package::make(name, pkgbuild.pkgver + "-" + pkgbuild.pkgrel, arch, destination);
-        output.write_pkginfo(pkgbuild, pkgdir, config.packager,
-            static_cast<uint64_t>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())));
-        if (!cli.noarchive) {
-            output.create_archive(pkgdir);
-            if (cli.sign && !cli.nosign && sign_archive(output.dest, cli.key) != 0)
-                throw package_error("failed to sign package archive " + output.dest.string());
-            archives.push_back(output.dest);
+    // ─── Sync missing build dependencies (makedepends/checkdepends) ─
+    if (cli.syncdeps) {
+        terminal::info("Syncing build dependencies...");
+        const int rc = alpm::install_sync_packages(pkgbuild.makedepends, pkgbuild.checkdepends, cli.noconfirm);
+        if (rc != 0) {
+            std::cerr << "error: failed to sync build dependencies\n";
+            return rc;
         }
     }
 
+    // ─── Set up environment with optimization flags ──────────────
+    setup_environment();
+
+    // ─── Delegate to makepkg ─────────────────────────────────────
+    // All source acquisition, checksum verification, prepare/build/check/
+    // package functions, and archive creation are handled by the real
+    // makepkg. We only inject our optimization flags and collect post-
+    // build results.
+    std::vector<std::string> args;
+    
+    // Determine PKGBUILD path
+    const auto pkgbuild_path = pkgbuild.source_path.empty()
+        ? (cli.packagefile.empty() ? "PKGBUILD" : cli.packagefile.string())
+        : pkgbuild.source_path.string();
+
+    // Build makepkg command line from CLI flags
+    if (cli.cleanbuild)  args.push_back("-C");
+    if (cli.clean)       args.push_back("-c");
+    if (cli.ignorearch)  args.push_back("--ignorearch");
+    if (cli.install)     args.push_back("-i");
+    if (cli.log)         args.push_back("--log");
+    if (cli.nobuild)     args.push_back("-o");
+    if (cli.noextract)   args.push_back("-e");
+    if (cli.noprepare)   args.push_back("--noprepare");
+    if (cli.nocheck)     args.push_back("--nocheck");
+    if (cli.check)       args.push_back("--check");
+    if (cli.force)       args.push_back("-f");
+    if (cli.holdver)     args.push_back("--holdver");
+    if (cli.noarchive)   args.push_back("--noarchive");
+    if (cli.sign && !cli.nosign) {
+        args.push_back("--sign");
+        if (cli.key) args.push_back("--key");
+        if (cli.key) args.push_back(*cli.key);
+    }
+    if (cli.nosign)      args.push_back("--nosign");
+    if (cli.skipchecksums) args.push_back("--skipchecksums");
+    if (cli.skipinteg)   args.push_back("--skipinteg");
+    if (cli.verifysource) args.push_back("--verifysource");
+    
+    // Pass through mflags
+    for (const auto& flag : cli.mflags) {
+        args.push_back("--mflags");
+        args.push_back(flag);
+    }
+
+    // Add PKGBUILD path as last argument
+    args.push_back(pkgbuild_path);
+
+    // Execute makepkg and capture output to log file
+    const auto log_file = log_dir_ / "makepkg.log";
+    int exit_code = execute_makepipe(args, log_file);
+    
+    if (exit_code != 0) {
+        std::cerr << "==> makepkg failed with exit code " << exit_code << "\n";
+        std::cerr << "==> Log: " << log_file.string() << "\n";
+        return exit_code;
+    }
+
+    // ─── Post-build: install if requested ────────────────────────
     if (cli.install) {
-        if (archives.empty()) throw package_error("cannot install when package archive creation is disabled");
-        std::vector<std::string> paths;
-        for (const auto& archive : archives) paths.push_back(archive.string());
-        alpm::install_files(paths, cli.noconfirm);
+        // Find the built package archive
+        const auto destination = std::filesystem::absolute(config.pkgdest);
+        std::vector<std::string> archives;
+        
+        for (const auto& entry : std::filesystem::directory_iterator(destination)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".pkg.tar.zst") {
+                archives.push_back(entry.path().string());
+            }
+        }
+        
+        if (!archives.empty()) {
+            alpm::install_files(archives, cli.noconfirm);
+        }
     }
 
     // ─── Report build timing ─────────────────────────────────────
@@ -189,14 +184,95 @@ int BuildOrchestrator::run() {
     
     int secs = total_duration_.count() / 1000;
     int ms = total_duration_.count() % 1000;
-    std::cout << "==> Build completed in " << secs << "s" << (ms > 0 ? " +" + std::to_string(ms) + "ms" : "")
-              << (retries_ > 0 ? ", " + std::to_string(retries_) + " retry(ies)" : "") << "\n";
+    std::cout << "==> Build completed in " << secs << "s" << (ms > 0 ? " +" + std::to_string(ms) + "ms" : "") << "\n";
     
     terminal::success("Build completed successfully");
     return 0;
 }
 
+int BuildOrchestrator::execute_makepipe(const std::vector<std::string>& args,
+                                        const std::filesystem::path& log_file) {
+    // Build full command: makepkg [flags] PKGBUILD
+    std::vector<std::string> cmd = {"makepkg"};
+    cmd.insert(cmd.end(), args.begin(), args.end());
+    cmd.push_back("--log");  // Enable makepkg's own logging to stderr
+
+    // Open log file for writing
+    std::ofstream log_out(log_file, std::ios::trunc);
+    if (!log_out) {
+        throw package_error("cannot open log file: " + log_file.string());
+    }
+
+    // Create pipe for capturing makepkg output
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        throw package_error("cannot create pipe for makepkg output");
+    }
+
+    const pid_t child = fork();
+    if (child < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        throw package_error("cannot create makepkg process");
+    }
+
+    if (child == 0) {
+        // Child: redirect stdout/stderr to log file and pipe
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+
+        // Also write directly to log file
+        int log_fd = open(log_file.c_str(), O_WRONLY | O_APPEND | O_CREAT, 0644);
+        if (log_fd >= 0) {
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
+            close(log_fd);
+        }
+
+        // Build argv
+        std::vector<char*> argv;
+        for (const auto& arg : cmd) {
+            argv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv.push_back(nullptr);
+
+        execvp("makepkg", argv.data());
+        _exit(127);
+    }
+
+    // Parent: read from pipe and write to log file
+    close(pipefd[1]);
+    {
+        char buf[8192];
+        ssize_t n;
+        while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+            log_out.write(buf, static_cast<std::streamsize>(n));
+            // Also write to terminal for real-time feedback
+            write(STDOUT_FILENO, buf, static_cast<size_t>(n));
+        }
+    }
+    close(pipefd[0]);
+
+    // Wait for child
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128;
+}
+
 void BuildOrchestrator::setup_environment() {
+    for (const auto& assignment : cli.extra_env) {
+        const auto separator = assignment.find('=');
+        if (separator == std::string::npos) continue;
+        const auto name = assignment.substr(0, separator);
+        if (!valid_environment_name(name))
+            throw package_error("invalid build environment variable: " + name);
+        const auto value = assignment.substr(separator + 1);
+        if (setenv(name.c_str(), value.c_str(), 1) != 0)
+            throw package_error("cannot set build environment variable: " + name);
+    }
+
     auto opt = optimize::OptConfig::from_cli(cli);
     opt.apply_compiler_env();
 
@@ -211,7 +287,7 @@ void BuildOrchestrator::setup_environment() {
     setenv("CXXFLAGS", cxxflags.c_str(), 1);
     setenv("LDFLAGS", ldflags.c_str(), 1);
 
-    // Apply --mflags: custom makepkg flags
+    // Apply --mflags as MAKEFLAGS for the package's underlying build tool.
     if (!cli.mflags.empty()) {
         std::ostringstream mflags_env;
         for (size_t i = 0; i < cli.mflags.size(); ++i) {
@@ -244,112 +320,6 @@ void BuildOrchestrator::setup_environment() {
     if (!ldflags.empty())  terminal::info("LDFLAGS: " + ldflags);
 }
 
-int BuildOrchestrator::run_function(const std::string& func_name,
-                                     const std::filesystem::path& srcdir,
-                                     const std::filesystem::path& pkgdir,
-                                     bool use_fakeroot) {
-    if (!pkgbuild.has_function(func_name)) {
-        std::cout << "==> No " << func_name << "() function found, skipping.\n";
-        return 0;
-    }
-
-    terminal::info("Running " + func_name + "()");
-
-    const auto script = pkgbuild.source_path.empty()
-        ? std::filesystem::absolute(cli.packagefile.empty() ? "PKGBUILD" : cli.packagefile)
-        : pkgbuild.source_path;
-    const std::string shell = "source \"$1\"; cd \"$2\"; \"$3\"";
-
-    // ─── Redirect stdout/stderr to per-function log file ─────────
-    const fs::path log_file = log_dir_ / (func_name + ".log");
-    int pipefd[2];
-    if (pipe(pipefd) < 0) {
-        throw package_error("cannot create pipe for build logging");
-    }
-
-    const pid_t child = fork();
-    if (child < 0) { close(pipefd[0]); close(pipefd[1]); throw package_error("cannot create build process"); }
-    if (child == 0) {
-        // Child: redirect stdout/stderr to log file, then exec
-        close(pipefd[0]);  // close read end
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
-
-        setenv("srcdir", srcdir.c_str(), 1);
-        setenv("startdir", script.parent_path().c_str(), 1);
-        if (!pkgdir.empty()) setenv("pkgdir", pkgdir.c_str(), 1);
-        if (use_fakeroot)
-            execlp("fakeroot", "fakeroot", "--", "bash", "-c", shell.c_str(), "pacmkr",
-                   script.c_str(), srcdir.c_str(), func_name.c_str(), static_cast<char*>(nullptr));
-        else
-            execlp("bash", "bash", "-c", shell.c_str(), "pacmkr", script.c_str(),
-                   srcdir.c_str(), func_name.c_str(), static_cast<char*>(nullptr));
-        _exit(127);
-    }
-
-    // Parent: read from pipe and write to log file, then wait for child
-    close(pipefd[1]);  // close write end
-    {
-        char buf[8192];
-        ssize_t n;
-        while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
-            fs::path log_path = log_dir_ / (func_name + ".log");
-            std::ofstream log_out(log_path, std::ios::app);
-            if (log_out) log_out.write(buf, n);
-        }
-    }
-    close(pipefd[0]);
-
-    int status = 0;
-    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-    const int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 128;
-    if (rc != 0) {
-        std::cerr << "==> " << func_name << "() failed. Log: " << log_file.string() << "\n";
-        return rc;
-    }
-
-    return 0;
-}
-
-std::string BuildOrchestrator::version() const {
-    return pkgbuild.full_version();
-}
-
-int BuildOrchestrator::run_with_retry(const std::string& func_name,
-                                       const std::filesystem::path& srcdir,
-                                       const std::filesystem::path& pkgdir,
-                                       bool use_fakeroot) {
-    int max_attempts = kMaxRetries + 1;  // initial + retries
-    
-    for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        int rc = run_function(func_name, srcdir, pkgdir, use_fakeroot);
-        if (rc == 0) return 0;
-        
-        // Retryable: transient failures (network, OOM, GPG issues)
-        // Non-retryable: syntax errors in PKGBUILD, missing tools
-        bool retryable = (rc == 127 || rc == 126);  // command not found / permission denied
-        
-        if (!retryable && attempt == 0) {
-            // For non-transient errors, try once more then give up
-            std::cout << "==> Retrying " << func_name << "() (attempt 2/" << max_attempts << ")...\n";
-            continue;
-        }
-        
-        if (attempt < max_attempts - 1) {
-            // Exponential backoff: 1s, 3s, 9s...
-            int delay_ms = kBaseRetryMs * (1 << attempt);
-            std::cout << "==> " << func_name << "() failed (exit " << rc << "). "
-                      << "Retrying in " << (delay_ms / 1000) << "s (attempt " 
-                      << (attempt + 2) << "/" << max_attempts << ")...\n";
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-            retries_++;
-        }
-    }
-    
-    return 1;
-}
-
 // ─── Parallel Build Support ──────────────────────────────────────────
 
 int run_parallel_builds(const std::vector<std::string>& package_dirs,
@@ -363,7 +333,6 @@ int run_parallel_builds(const std::vector<std::string>& package_dirs,
         try {
             cli::Cli cli = base_cli;
             cli.install = true;
-            cli.nocheck = true;
 
             BuildOrchestrator orchestrator{cli, config, pkgbuild::Pkgbuild::parse(dir + "/PKGBUILD")};
             int rc = orchestrator.run();

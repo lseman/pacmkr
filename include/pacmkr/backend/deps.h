@@ -80,6 +80,9 @@ std::vector<OutOfDatePkg> detect_out_of_date();
 /// upgrade overlap the AUR check with the repository transaction.
 std::future<std::vector<OutOfDatePkg>> detect_out_of_date_async();
 
+/// Extract the package name from a dependency spec (strips version constraints).
+std::string parse_dep_spec(const std::string& spec);
+
 /// Check if a package name looks like a dev/VCS package (-git, -dev, etc.)
 bool is_dev_package(const std::string& pkgname);
 

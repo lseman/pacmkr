@@ -1,6 +1,7 @@
 #include "pacmkr/app/cli.h"
 #include "pacmkr/core/config.h"
 #include "pacmkr/backend/aur.h"
+#include "pacmkr/backend/aur_review.h"
 #include "pacmkr/backend/aur_cache.h"
 #include "pacmkr/backend/alpm.h"
 #include "pacmkr/backend/deps.h"
@@ -35,9 +36,21 @@
 #include "json.hpp"
 using json = nlohmann::json;
 
+using namespace pacmkr;
+
 namespace {
 
-using namespace pacmkr;
+std::filesystem::path prepare_aur_package(const std::string& package,
+                                          const std::filesystem::path& destination,
+                                          const cli::Cli& cli) {
+    const auto pkgbuild = aur::download_pkgbuild(package, destination);
+    auto review = aur_review::inspect(pkgbuild.parent_path());
+    if (!aur_review::confirm(review, cli.no_review)) {
+        throw source_error("AUR commit was not approved: " + package);
+    }
+    if (!cli.no_review && !review.already_reviewed()) aur_review::mark_reviewed(review);
+    return pkgbuild;
+}
 
 // Forward declarations — functions defined later in this file
 int run_upgrade(const cli::Cli& cli);
@@ -221,23 +234,6 @@ bool is_sync_install(const std::vector<std::string>& args) {
     return has_s && !has_y && !has_u && !has_f && !has_c;
 }
 
-/// Extract package names from sync install args.
-std::vector<std::string> extract_install_packages(const std::vector<std::string>& args) {
-    std::vector<std::string> packages;
-    bool found_s = false;
-    for (auto& arg : args) {
-        if (arg == "--sync" || arg == "-S") { found_s = true; continue; }
-        if (found_s && arg.size() >= 2 && arg[0] == '-') {
-            // Flags after -S are not packages
-            break;
-        }
-        if (found_s) {
-            packages.push_back(arg);
-        }
-    }
-    return packages;
-}
-
 /// Print the compiler and flags pacmkr would use to build packages, resolved
 /// the same way BuildOrchestrator::setup_environment() does: makepkg.conf
 /// baselines (or the matching environment variable), plus the optimization
@@ -382,19 +378,11 @@ int run_sync_read(const std::vector<std::string>& args) {
                 unsigned int limit = 10;
                 for (auto& arg : args) {
                     if (arg.rfind("--limit=", 0) == 0 || arg.rfind("-n", 0) == 0) {
-                        try { limit = std::stoul(arg.substr(arg.find('=') + 1)); } catch (...) {}
-                    }
-                }
-
-                // Parse --sortby from args
-                aur_cache::SortOrder sort_order = aur_cache::SortOrder::Votes;
-                for (auto& arg : args) {
-                    if (arg.rfind("--sortby=", 0) == 0) {
-                        auto val = arg.substr(9);
-                        std::transform(val.begin(), val.end(), val.begin(), ::tolower);
-                        if (val == "updated" || val == "date") sort_order = aur_cache::SortOrder::Updated;
-                        else if (val == "popular") sort_order = aur_cache::SortOrder::Popular;
-                        else sort_order = aur_cache::SortOrder::Votes;
+                        try {
+                            const auto parsed = std::stoul(arg.substr(arg.find('=') + 1));
+                            if (parsed <= std::numeric_limits<unsigned int>::max())
+                                limit = static_cast<unsigned int>(parsed);
+                        } catch (...) {}
                     }
                 }
 
@@ -450,7 +438,7 @@ int run_sync_read(const std::vector<std::string>& args) {
 
                     if (!input.empty() && input != "\x1b") {  // Not Esc
                         try {
-                            unsigned int idx = std::stoul(input) - 1;
+                            const size_t idx = std::stoul(input) - 1;
                             if (idx < results.size()) {
                                 auto& r = results[idx];
                                 std::cout << "\n==> Selected: " << r.name << "\n";
@@ -785,30 +773,28 @@ int run_upgrade(const cli::Cli& cli) {
         ? "Syncing databases & upgrading repositories"
         : "Upgrading repository packages");
 
-    // Kick off the AUR out-of-date check now: its libalpm reads run
-    // synchronously here, then the network query runs on a worker thread while
-    // the repository transaction below proceeds, hiding the round-trip.
+    // Start the network portion early, but do not mutate the system until all
+    // AUR metadata has resolved and every changed build file has been reviewed.
     auto ootd_future = deps::detect_out_of_date_async();
 
-    // Refresh and upgrade in one transaction. Splitting -Sy and -Su can create
-    // a partial-upgrade window and was also skipping refresh because -Syu sets
-    // refresh_db (not the AUR-only refresh flag).
-    if (cli.refresh_db) alpm::refresh_databases();
-    int rc = alpm::system_upgrade(false, cli.noconfirm,
-                                  cli.ignore, cli.ignoregroup, cli.overwrite);
-    if (rc != 0) {
-        std::cerr << "error: repository upgrade failed with exit code " << rc << "\n";
+    auto upgrade_repositories = [&]() -> int {
+        if (cli.refresh_db) alpm::refresh_databases();
+        const int rc = alpm::system_upgrade(false, cli.noconfirm,
+                                            cli.ignore, cli.ignoregroup, cli.overwrite);
+        if (rc != 0)
+            std::cerr << "error: repository upgrade failed with exit code " << rc << "\n";
+        else
+            terminal::success("Repository phase complete");
         return rc;
-    }
-
-    terminal::success("Repository phase complete");
+    };
 
     // Step 3: Collect the AUR out-of-date results started before the transaction.
     std::vector<deps::OutOfDatePkg> ootd;
     try {
         ootd = ootd_future.get();
     } catch (const std::exception& e) {
-        std::cerr << "warning: AUR update check failed: " << e.what() << "\n";
+        std::cerr << "error: cannot create a complete upgrade plan: " << e.what() << "\n";
+        return 1;
     }
 
     // Filter dev packages if --nodevel is set
@@ -820,6 +806,7 @@ int run_upgrade(const cli::Cli& cli) {
 
     if (ootd.empty()) {
         terminal::success("AUR packages are already current");
+        if (const int rc = upgrade_repositories(); rc != 0) return rc;
         std::cout << "\n";
         terminal::success("System upgrade complete");
         return 0;
@@ -841,7 +828,7 @@ int run_upgrade(const cli::Cli& cli) {
         graph.print_plan(names);
 
         if (graph.aur_count() == 0) {
-            return 0;
+            return upgrade_repositories();
         }
 
         std::filesystem::create_directories(aur_dir);
@@ -856,7 +843,7 @@ int run_upgrade(const cli::Cli& cli) {
         for (size_t i = 0; i < graph.build_order.size(); ++i) {
             auto& build_pkg = graph.build_order[i];
             terminal::info("Preparing " + build_pkg);
-            const auto pkgbuild_path = aur::download_pkgbuild(build_pkg, aur_dir);
+            const auto pkgbuild_path = prepare_aur_package(build_pkg, aur_dir, cli);
             const auto pkg_dir = pkgbuild_path.parent_path();
 
             // Parse PKGBUILD to collect validpgpkeys
@@ -867,6 +854,9 @@ int run_upgrade(const cli::Cli& cli) {
 
             pkg_dirs.push_back(pkg_dir.string());
         }
+
+        // All trust decisions are complete before the first system mutation.
+        if (const int rc = upgrade_repositories(); rc != 0) return rc;
 
         // Auto-fetch PGP keys if --pgpfetch is set
         if (cli.pgp_fetch && !all_pgp_keys.empty()) {
@@ -888,9 +878,10 @@ int run_upgrade(const cli::Cli& cli) {
         max_jobs = std::min(max_jobs, static_cast<int>(graph.build_order.size()));
         if (max_jobs < 1) max_jobs = 1;
 
-        // Building currently changes the process working directory. Keep AUR
-        // builds sequential until each build has a fully isolated workspace.
-        bool use_parallel = false;
+        // Enable parallel builds across dependency groups when multiple packages
+        // are queued. Each thread uses its own BuildOrchestrator with isolated
+        // working directories, so there is no shared state conflict.
+        const bool use_parallel = graph.parallel_groups.size() > 1 && max_jobs > 1;
 
         if (use_parallel) {
             // Parallel build across dependency groups
@@ -931,7 +922,6 @@ int run_upgrade(const cli::Cli& cli) {
                 cli::Cli build_cli = cli;
                 // AUR dependencies must be installed before their dependents.
                 build_cli.install = true;
-                build_cli.nocheck = true;
 
                 std::cout << "==> Building " << build_pkg << "\n";
                 int rc = run_local_build(build_cli, config::Config::load());
@@ -959,7 +949,7 @@ int run_upgrade(const cli::Cli& cli) {
                 }
             }
         }
-    } catch (const source_error& e) {
+    } catch (const std::exception& e) {
         std::cerr << "error: AUR build failed: " << e.what() << "\n";
         return 1;
     }
@@ -1052,6 +1042,11 @@ int run_upgrade_dry_run(const cli::Cli& cli) {
 }
 
 int run_local_build(const cli::Cli& cli, const config::Config& config) {
+    WorkingDirectoryGuard cwd_guard;
+    const auto directory = cli.dir.empty()
+        ? std::filesystem::current_path()
+        : std::filesystem::absolute(cli.dir);
+    std::filesystem::current_path(directory);
     auto pkgbuild_path = cli.packagefile.empty() ? std::filesystem::path{"PKGBUILD"} : cli.packagefile;
 
     if (!std::filesystem::exists(pkgbuild_path)) {
@@ -1089,7 +1084,7 @@ int run_aur_build(cli::Cli cli) {
     std::filesystem::create_directories(aur_dir);
 
     terminal::info("Preparing " + pkgname);
-    const auto pkgbuild_path = aur::download_pkgbuild(pkgname, aur_dir);
+    const auto pkgbuild_path = prepare_aur_package(pkgname, aur_dir, cli);
     const auto pkgdir = pkgbuild_path.parent_path();
     terminal::success("PKGBUILD ready");
 
@@ -1102,6 +1097,7 @@ int run_aur_build(cli::Cli cli) {
                 std::cout << "==> Building " << graph.aur_count()
                           << " package(s) in dependency order\n";
 
+                std::vector<std::pair<std::string, std::filesystem::path>> build_steps;
                 for (size_t i = 0; i < graph.build_order.size(); ++i) {
                     auto& build_pkg = graph.build_order[i];
                     bool is_root = (build_pkg == pkgname);
@@ -1109,16 +1105,21 @@ int run_aur_build(cli::Cli cli) {
                               << (is_root ? "\xe2\x98\x85" : "\xe2\x86\xb4")
                               << " " << build_pkg << "\n";
 
-                    const auto step_pkgbuild = aur::download_pkgbuild(build_pkg, aur_dir);
-                    const auto step_dir = step_pkgbuild.parent_path();
+                    const auto step_pkgbuild = prepare_aur_package(build_pkg, aur_dir, cli);
+                    build_steps.emplace_back(build_pkg, step_pkgbuild.parent_path());
+                }
 
-                    std::filesystem::current_path(step_dir);
-
-                    if (!is_root) {
+                // Build only after every package in the graph has been reviewed.
+                for (const auto& [build_pkg, step_dir] : build_steps) {
+                    if (build_pkg != pkgname) {
+                        std::filesystem::current_path(step_dir);
                         cli::Cli dep_cli = cli;
                         dep_cli.install = true;
-                        dep_cli.nocheck = true;
-                        run_local_build(dep_cli, config::Config::load());
+                        const int rc = run_local_build(dep_cli, config::Config::load());
+                        if (rc != 0) {
+                            std::cerr << "error: failed to build dependency " << build_pkg << "\n";
+                            return rc;
+                        }
                         std::cout << "\n";
                     }
                 }
@@ -1128,9 +1129,9 @@ int run_aur_build(cli::Cli cli) {
                     std::filesystem::current_path(root_pkgdir);
                 }
             }
-        } catch (const source_error& e) {
-            std::cerr << "warning: dependency resolution failed: " << e.what() << "\n";
-            std::cerr << "==> Building without dependency resolution.\n\n";
+        } catch (const std::exception& e) {
+            std::cerr << "error: dependency resolution failed: " << e.what() << "\n";
+            return 1;
         }
     }
 
@@ -1177,7 +1178,21 @@ int run_sync_install(const cli::Cli& cli) {
         }
     }
 
-    // Install repository packages through libalpm.
+    // Fetch and review all AUR files before the first system mutation.
+    std::vector<std::filesystem::path> aur_package_dirs;
+    const auto aur_dir = std::filesystem::absolute(
+        cli.aur_dir.empty() ? std::filesystem::path{"aur"} : cli.aur_dir);
+    if (!aur_pkgs.empty()) {
+        std::filesystem::create_directories(aur_dir);
+        for (const auto& pkgname : aur_pkgs) {
+            terminal::info("Preparing " + pkgname);
+            const auto pkgbuild_path = prepare_aur_package(pkgname, aur_dir, cli);
+            aur_package_dirs.push_back(pkgbuild_path.parent_path());
+            terminal::success("PKGBUILD ready");
+        }
+    }
+
+    // Install repository packages through libalpm after review succeeds.
     if (!repo_pkgs.empty()) {
         terminal::section("Repository packages");
         terminal::info("Installing " + std::to_string(repo_pkgs.size()) + " package(s)");
@@ -1194,22 +1209,12 @@ int run_sync_install(const cli::Cli& cli) {
         terminal::section("AUR packages");
         terminal::info("Building " + std::to_string(aur_pkgs.size()) + " package(s)");
 
-        const auto aur_dir = std::filesystem::absolute(
-            cli.aur_dir.empty() ? std::filesystem::path{"aur"} : cli.aur_dir);
-        std::filesystem::create_directories(aur_dir);
-
-        for (auto& pkgname : aur_pkgs) {
-            terminal::info("Preparing " + pkgname);
-
-            const auto pkgbuild_path = aur::download_pkgbuild(pkgname, aur_dir);
-            const auto pkgdir = pkgbuild_path.parent_path();
-            terminal::success("PKGBUILD ready");
-
-            std::filesystem::current_path(pkgdir);
+        for (size_t index = 0; index < aur_pkgs.size(); ++index) {
+            const auto& pkgname = aur_pkgs[index];
+            std::filesystem::current_path(aur_package_dirs[index]);
 
             cli::Cli build_cli = cli;
             build_cli.install = true;
-            build_cli.nocheck = true;
 
             auto sys_config = config::Config::load();
             int rc = run_local_build(build_cli, sys_config);

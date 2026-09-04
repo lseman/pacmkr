@@ -58,8 +58,14 @@ std::vector<AurPackage> search(const std::string& query);
 /// Fetch full info for a single AUR package.
 AurPackageInfo fetch(const std::string& pkgname);
 
-/// Fetch full info for multiple AUR packages in one RPC call.
+/// Fetch full info for multiple AUR packages. Large request sets are split
+/// into several RPC calls so the AUR's URL-length limit is never hit.
 std::vector<AurPackageInfo> fetch_batch(const std::vector<std::string>& pkgnames);
+
+/// AUR package bases that satisfy a virtual dependency (RPC `by=provides`),
+/// best match first (exact name, then vote count). The version constraint,
+/// if any, is stripped before the query.
+std::vector<std::string> providers(const std::string& dep);
 
 /// Download PKGBUILD from AUR git repo into dest directory.
 /// Returns the path to the PKGBUILD file.

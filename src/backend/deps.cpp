@@ -2,6 +2,7 @@
 #include "pacmkr/backend/aur.h"
 #include "pacmkr/backend/aur_cache.h"
 #include "pacmkr/backend/alpm.h"
+#include "pacmkr/backend/dep_graph.h"
 #include "pacmkr/core/error.h"
 #include "pacmkr/app/terminal.h"
 
@@ -18,282 +19,6 @@
 
 namespace pacmkr::deps {
 
-namespace {
-
-// ─── pkgvercmp (Arch Linux algorithm) ────────────────────────────────
-
-enum class TokenKind { Null, Numeric, Alpha };
-struct Token {
-    TokenKind kind;
-    unsigned long long num_val{};
-    std::string str_val;
-    bool tilde{false};
-};
-
-static int strverscmp_impl(const std::string& a, const std::string& b) {
-    auto lower = [](std::string s) -> std::string {
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-        return s;
-    };
-
-    std::string la = lower(a), lb = lower(b);
-
-    // Special keyword ordering (from Arch's pkgver.c)
-    static const char* keywords[] = {"", "pre", "c", "rc", "a", "b", "ssl", "rel"};
-
-    auto kw_pos = [&](const std::string& s) -> int {
-        for (int i = 0; i < static_cast<int>(sizeof(keywords)/sizeof(keywords[0])); ++i) {
-            if (keywords[i] == s) return i;
-        }
-        return -1;
-    };
-
-    int ai = kw_pos(la), bi = kw_pos(lb);
-    if (ai >= 0 && bi >= 0) return (ai < bi ? -1 : (ai > bi ? 1 : 0));
-    if (ai >= 0) return -1;
-    if (bi >= 0) return 1;
-
-    // Numeric comparison for alpha segments containing digits
-    auto a_num = la.find_first_of("0123456789");
-    auto b_num = lb.find_first_of("0123456789");
-    if (a_num != std::string::npos && b_num != std::string::npos) {
-        unsigned long long an = std::stoull(la.substr(a_num));
-        unsigned long long bn = std::stoull(lb.substr(b_num));
-        if (an != bn) return (an < bn ? -1 : 1);
-    }
-
-    return la.compare(lb);
-}
-
-std::vector<Token> tokenize(const std::string& s) {
-    std::vector<Token> tokens;
-    size_t i = 0;
-
-    while (i < s.size()) {
-        Token tok{};
-
-        if (s[i] == '~') {
-            tok.tilde = true;
-            ++i;
-            // Read tilde-numeric or tilde-alpha
-            if (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
-                tok.kind = TokenKind::Numeric;
-                size_t start = i;
-                while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
-                tok.num_val = std::stoull(s.substr(start, i - start));
-            } else {
-                tok.kind = TokenKind::Alpha;
-                size_t start = i;
-                while (i < s.size() && std::isalpha(static_cast<unsigned char>(s[i]))) ++i;
-                tok.str_val = s.substr(start, i - start);
-            }
-        } else if (std::isdigit(static_cast<unsigned char>(s[i]))) {
-            tok.kind = TokenKind::Numeric;
-            size_t start = i;
-            while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
-            tok.num_val = std::stoull(s.substr(start, i - start));
-        } else if (std::isalpha(static_cast<unsigned char>(s[i]))) {
-            tok.kind = TokenKind::Alpha;
-            size_t start = i;
-            while (i < s.size() && std::isalpha(static_cast<unsigned char>(s[i]))) ++i;
-            tok.str_val = s.substr(start, i - start);
-        } else {
-            ++i; // skip unknown characters
-            continue;
-        }
-
-        tokens.push_back(tok);
-    }
-
-    tokens.push_back({TokenKind::Null});
-    return tokens;
-}
-
-int pkgvercmp(const std::string& a, const std::string& b) {
-    auto ta = tokenize(a), tb = tokenize(b);
-    size_t ai = 0, bi = 0;
-
-    while (ai < ta.size() && bi < tb.size()) {
-        auto& tok_a = ta[ai], tok_b = tb[bi];
-
-        if (tok_a.kind == TokenKind::Null && tok_b.kind == TokenKind::Null) return 0;
-        if (tok_a.kind == TokenKind::Null) return -1;
-        if (tok_b.kind == TokenKind::Null) return 1;
-
-        // Same kind comparison
-        if (tok_a.kind == TokenKind::Numeric && tok_b.kind == TokenKind::Numeric) {
-            // Tilde < normal for same numeric value
-            if (tok_a.tilde != tok_b.tilde) return tok_a.tilde ? -1 : 1;
-            if (tok_a.num_val != tok_b.num_val) return (tok_a.num_val < tok_b.num_val ? -1 : 1);
-        } else if (tok_a.kind == TokenKind::Alpha && tok_b.kind == TokenKind::Alpha) {
-            if (tok_a.tilde != tok_b.tilde) return tok_a.tilde ? -1 : 1;
-            int c = strverscmp_impl(tok_a.str_val, tok_b.str_val);
-            if (c != 0) return c;
-        } else {
-            // Mixed: numeric vs alpha — compare numeric-as-string to alpha
-            std::string num_str = std::to_string(tok_a.kind == TokenKind::Numeric ? tok_a.num_val : tok_b.num_val);
-            const std::string& alpha_str = tok_a.kind == TokenKind::Alpha ? tok_a.str_val : tok_b.str_val;
-            int c = strverscmp_impl(num_str, alpha_str);
-            if (c != 0) return c;
-        }
-
-        ++ai; ++bi;
-    }
-
-    // Remaining tokens
-    if (ai < ta.size()) {
-        // Check if remaining are Null
-        bool all_null = true;
-        for (; ai < ta.size(); ++ai) if (ta[ai].kind != TokenKind::Null) { all_null = false; break; }
-        return all_null ? 0 : 1;
-    }
-    if (bi < tb.size()) {
-        bool all_null = true;
-        for (; bi < tb.size(); ++bi) if (tb[bi].kind != TokenKind::Null) { all_null = false; break; }
-        return all_null ? 0 : -1;
-    }
-
-    return 0;
-}
-
-/// Compare two Arch Linux version segments (split on '-').
-/// Handles '~': tilde sorts before any character or end-of-string.
-/// Dots are skipped (not significant). Uses keyword ordering for alpha.
-/// Empty segment means "no release" (final), which is greater than any
-/// pre-release or numbered release (non-empty < empty).
-static int compare_segment(const std::string& a, const std::string& b) {
-    // Empty segment = no release (final) > any non-empty segment
-    if (a.empty() && !b.empty()) return 1;
-    if (!a.empty() && b.empty()) return -1;
-    if (a.empty() && b.empty()) return 0;
-
-    std::string la = a, lb = b;
-    std::transform(la.begin(), la.end(), la.begin(), ::tolower);
-    std::transform(lb.begin(), lb.end(), lb.begin(), ::tolower);
-
-    size_t ai = 0, bi = 0;
-    while (ai < la.size() || bi < lb.size()) {
-        // Skip dots (not significant in Arch versioning)
-        if (ai < la.size() && la[ai] == '.') { ++ai; continue; }
-        if (bi < lb.size() && lb[bi] == '.') { ++bi; continue; }
-
-        bool a_end = (ai >= la.size()), b_end = (bi >= lb.size());
-
-        // Tilde sorts before everything else, including end-of-string.
-        // Check tilde BEFORE end-of-string so "1~rc1" < "1".
-        if (!a_end && !b_end) {
-            if (la[ai] == '~' && lb[bi] != '~') return -1;
-            if (lb[bi] == '~' && la[ai] != '~') return 1;
-        } else if (!a_end && b_end) {
-            // a has chars left, b exhausted — tilde < nothing
-            if (la[ai] == '~') return -1;
-            return 1;
-        } else if (a_end && !b_end) {
-            // b has chars left, a exhausted — nothing > tilde
-            if (lb[bi] == '~') return 1;
-            return -1;
-        } else {
-            return 0;
-        }
-
-        bool a_digit = std::isdigit(static_cast<unsigned char>(la[ai]));
-        bool b_digit = std::isdigit(static_cast<unsigned char>(lb[bi]));
-
-        if (a_digit && b_digit) {
-            // Both numeric: compare as numbers
-            size_t a_start = ai, b_start = bi;
-            while (ai < la.size() && std::isdigit(static_cast<unsigned char>(la[ai]))) ++ai;
-            while (bi < lb.size() && std::isdigit(static_cast<unsigned char>(lb[bi]))) ++bi;
-            std::string anum = la.substr(a_start, ai - a_start);
-            std::string bnum = lb.substr(b_start, bi - b_start);
-            if (anum.size() != bnum.size()) return (anum.size() < bnum.size() ? -1 : 1);
-            if (anum != bnum) return (anum < bnum ? -1 : 1);
-        } else if (a_digit || b_digit) {
-            // Mixed: digit sorts before letter
-            return a_digit ? -1 : 1;
-        } else {
-            // Both alpha: compare lexicographically with keyword ordering
-            size_t a_start = ai, b_start = bi;
-            while (ai < la.size() && std::isalpha(static_cast<unsigned char>(la[ai]))) ++ai;
-            while (bi < lb.size() && std::isalpha(static_cast<unsigned char>(lb[bi]))) ++bi;
-            std::string aalpha = la.substr(a_start, ai - a_start);
-            std::string balpha = lb.substr(b_start, bi - b_start);
-
-            // Special keyword ordering (from Arch's pkgver.c)
-            static const char* keywords[] = {"pre", "c", "rc", "a", "b", "ssl", "rel"};
-            auto kw_pos = [&](const std::string& s) -> int {
-                for (int i = 0; i < static_cast<int>(sizeof(keywords)/sizeof(keywords[0])); ++i) {
-                    if (keywords[i] == s) return i;
-                }
-                return -1;
-            };
-
-            int ka = kw_pos(aalpha), kb = kw_pos(balpha);
-            if (ka >= 0 && kb >= 0) {
-                if (ka != kb) return (ka < kb ? -1 : 1);
-            } else if (ka >= 0) {
-                return -1;
-            } else if (kb >= 0) {
-                return 1;
-            } else {
-                if (aalpha != balpha) return (aalpha < balpha ? -1 : 1);
-            }
-        }
-    }
-
-    return 0;
-}
-
-/// Arch Linux pkgvercmp: split on '-', compare segments.
-static int arch_pkgvercmp(const std::string& a, const std::string& b) {
-    auto split = [](const std::string& s) -> std::vector<std::string> {
-        std::vector<std::string> parts;
-        size_t start = 0;
-        for (size_t i = 0; i <= s.size(); ++i) {
-            if (i == s.size() || s[i] == '-') {
-                parts.push_back(s.substr(start, i - start));
-                start = i + 1;
-            }
-        }
-        return parts;
-    };
-
-    auto a_parts = split(a), b_parts = split(b);
-    size_t max_len = std::max(a_parts.size(), b_parts.size());
-    for (size_t i = 0; i < max_len; ++i) {
-        const auto& pa = (i < a_parts.size()) ? a_parts[i] : "";
-        const auto& pb = (i < b_parts.size()) ? b_parts[i] : "";
-        int c = compare_segment(pa, pb);
-        if (c != 0) return c;
-    }
-    return 0;
-}
-
-int compare_epoch_upstream_release(const std::string& a, const std::string& b) {
-    auto parse_ver = [](const std::string& v) -> std::tuple<unsigned long long, std::string> {
-        auto colon = v.find(':');
-        unsigned long long epoch = 0;
-        std::string rest = v;
-
-        if (colon != std::string::npos) {
-            try { epoch = std::stoull(v.substr(0, colon)); } catch (...) {}
-            rest = v.substr(colon + 1);
-        }
-
-        return {epoch, rest};
-    };
-
-    auto [a_epoch, a_rest] = parse_ver(a);
-    auto [b_epoch, b_rest] = parse_ver(b);
-
-    if (a_epoch != b_epoch) return (a_epoch < b_epoch ? -1 : 1);
-    // Full version comparison handles all edge cases: tildes, pre-releases,
-    // numeric segments, keyword ordering, etc.
-    return arch_pkgvercmp(a_rest, b_rest);
-}
-
-// ─── Dependency resolution helpers ───────────────────────────────────
-
 std::string parse_dep_spec(const std::string& spec) {
     for (char sep : {'>', '<', '='}) {
         auto pos = spec.find(sep);
@@ -302,63 +27,19 @@ std::string parse_dep_spec(const std::string& spec) {
     return spec;
 }
 
+namespace {
+
+// These accept a full dependency string (name plus an optional version
+// constraint, e.g. "foo>=1.2"). libalpm's satisfier lookup honors both the
+// constraint and any package that merely `provides` the name, so an
+// out-of-date installed dependency no longer counts as satisfied and virtual
+// dependencies resolve to their real providers.
 bool check_installed(const std::string& dep) {
-    return alpm::get_local_package(parse_dep_spec(dep)).has_value();
+    return alpm::local_satisfier(dep).has_value();
 }
 
 bool check_official(const std::string& dep) {
-    return alpm::get_sync_package(parse_dep_spec(dep)).has_value();
-}
-
-std::string parse_pacman_version(const std::string& output) {
-    std::istringstream stream(output);
-    std::string line;
-    while (std::getline(stream, line)) {
-        if (detail::starts_with(line, "Version ")) {
-            auto colon = line.find(':');
-            if (colon != std::string::npos) {
-                auto ver = line.substr(colon + 1);
-                // Trim whitespace
-                auto start = ver.find_first_not_of(" \t");
-                if (start != std::string::npos) return ver.substr(start);
-            }
-        }
-    }
-    return "0";
-}
-
-std::string extract_pkgver_from_git(const std::string& pkgname,
-                                     const std::filesystem::path& tmpdir) {
-    auto pkgdir = tmpdir / pkgname;
-    std::ostringstream cmd;
-    cmd << "git clone --depth 1 \"https://aur.archlinux.org/" << pkgname << ".git\" \""
-        << pkgdir.string() << "\" 2>/dev/null";
-
-    if (std::system(cmd.str().c_str()) != 0) return "0";
-
-    auto pkgbuild_path = pkgdir / "PKGBUILD";
-    std::ifstream in(pkgbuild_path);
-    if (!in) return "0";
-
-    std::string line;
-    while (std::getline(in, line)) {
-        auto t = line;
-        // Trim leading whitespace
-        auto start = t.find_first_not_of(" \t");
-        if (start != std::string::npos) t = t.substr(start);
-
-        if (detail::starts_with(line, "pkgver=")) {
-            auto val = t.substr(7);
-            // Strip quotes and trailing comments
-            auto end = val.find_first_of(" #\"'");
-            if (end != std::string::npos) val = val.substr(0, end);
-            // Trim
-            auto e2 = val.find_last_not_of(" \t\r\n");
-            if (e2 != std::string::npos) val = val.substr(0, e2 + 1);
-            return val;
-        }
-    }
-    return "0";
+    return alpm::sync_satisfier(dep).has_value();
 }
 
 } // anonymous
@@ -377,26 +58,33 @@ bool is_dev_package(const std::string& pkgname) {
 }
 
 int compare_versions(const std::string& a, const std::string& b) {
-    return compare_epoch_upstream_release(a, b);
+    // Delegate to libalpm's canonical comparison — the same routine pacman
+    // uses to decide upgrades — so pacmkr never disagrees with pacman about
+    // which version is newer.
+    return alpm::vercmp(a, b);
 }
 
 DepGraph resolve(const std::vector<std::string>& roots,
                  bool include_makedeps,
                  bool include_checkdeps,
-                 bool _include_optdeps) {
+                 bool include_optdeps) {
     DepGraph graph;
 
     // Discover + fetch AUR packages in batches (parallel RPC calls).
     // Each round: collect unknown names → batch-fetch → discover new deps.
     std::set<std::string> to_fetch(roots.begin(), roots.end());
     std::map<std::string, aur::AurPackageInfo> resolved;
+    // A dependency named virtually (satisfied only by another package's
+    // `provides`) maps here to the AUR pkgbase that actually supplies it.
+    std::map<std::string, std::string> provider_map;
+    std::set<std::string> unresolved;
 
     while (!to_fetch.empty()) {
         // Collect all names to fetch this round
         std::vector<std::string> batch(to_fetch.begin(), to_fetch.end());
         to_fetch.clear();
 
-        // Batch-fetch all packages in one RPC call
+        // Batch-fetch all packages (fetch_batch chunks large request sets).
         std::vector<aur::AurPackageInfo> infos;
         try {
             infos = aur::fetch_batch(batch);
@@ -413,31 +101,67 @@ DepGraph resolve(const std::vector<std::string>& roots,
             auto add_new_deps = [&](const std::vector<std::string>& dependencies) {
                 for (const auto& raw : dependencies) {
                     const auto name = parse_dep_spec(raw);
-                    if (!name.empty() && !check_installed(name) && !check_official(name)
-                        && resolved.find(name) == resolved.end()
-                        && to_fetch.find(name) == to_fetch.end()) {
-                        to_fetch.insert(name);
+                    if (name.empty()) continue;
+                    // Pass the full spec so a version constraint or a
+                    // provides-only match is evaluated correctly.
+                    if (check_installed(raw) || check_official(raw)) continue;
+                    if (resolved.count(name) || to_fetch.count(name)
+                        || provider_map.count(name)) {
+                        continue;
                     }
+                    to_fetch.insert(name);
                 }
             };
             add_new_deps(info.depends);
             if (include_makedeps) add_new_deps(info.makedepends);
             if (include_checkdeps) add_new_deps(info.checkdepends);
+            if (include_optdeps) add_new_deps(info.optdepends);
             resolved[info.name] = info;
         };
 
+        // Track which requested names an RPC result actually accounted for,
+        // whether by exact name, by pkgbase, or by a `provides` entry.
+        std::set<std::string> accounted;
         for (auto& info : infos) {
             try {
                 process_info(info);
+                accounted.insert(info.name);
+                if (!info.pkgname.empty()) accounted.insert(info.pkgname);
+                for (const auto& prov : info.provides) accounted.insert(parse_dep_spec(prov));
             } catch (const source_error&) {
                 std::cerr << "warning: '" << info.name << "' not found in AUR\n";
             }
         }
+
+        // Names with no direct AUR package: try to resolve them through a
+        // provider (RPC `by=provides`) before giving up.
+        for (const auto& name : batch) {
+            if (accounted.count(name) || resolved.count(name)) continue;
+            const auto candidates = aur::providers(name);
+            if (candidates.empty()) {
+                unresolved.insert(name);
+                continue;
+            }
+            const std::string& provider = candidates.front();
+            provider_map[name] = provider;
+            if (!resolved.count(provider)) to_fetch.insert(provider);
+        }
+    }
+
+    if (!unresolved.empty()) {
+        std::ostringstream message;
+        message << "no package or provider found for ";
+        size_t index = 0;
+        for (const auto& name : unresolved) {
+            if (index++ != 0) message << ", ";
+            message << "'" << name << "'";
+        }
+        throw dependency_error(message.str());
     }
 
     // Build dependency edges
     for (auto& [name, info] : resolved) {
-        BuildNode node{name};
+        BuildNode node{name, {}, {}, {}};
         node.info = info;
 
         // Collect deps
@@ -445,19 +169,22 @@ DepGraph resolve(const std::vector<std::string>& roots,
             for (auto& raw : dep_list) {
                 std::string dep_name = parse_dep_spec(raw);
 
-                // Check installed
-                if (check_installed(dep_name)) {
-                    node.non_aur_deps.push_back({dep_name, kind, DepSource::Installed});
+                // Check installed (full spec: honors version constraint + provides)
+                if (check_installed(raw)) {
+                    node.non_aur_deps.push_back({dep_name, kind, DepSource::Installed, std::nullopt});
                     continue;
                 }
 
                 // Check official repo
-                if (check_official(dep_name)) {
-                    node.non_aur_deps.push_back({dep_name, kind, DepSource::Official});
+                if (check_official(raw)) {
+                    node.non_aur_deps.push_back({dep_name, kind, DepSource::Official, std::nullopt});
                     continue;
                 }
 
-                // Must be AUR
+                // Must be AUR — resolve a virtual name to its real provider.
+                if (auto it = provider_map.find(dep_name); it != provider_map.end()) {
+                    dep_name = it->second;
+                }
                 node.aur_deps.push_back(dep_name);
             }
         };
@@ -465,66 +192,15 @@ DepGraph resolve(const std::vector<std::string>& roots,
         add_dep(info.depends, DepKind::Runtime);
         if (include_makedeps)  add_dep(info.makedepends, DepKind::Make);
         if (include_checkdeps) add_dep(info.checkdepends, DepKind::Check);
+        if (include_optdeps)   add_dep(info.optdepends, DepKind::Opt);
 
         graph.nodes[name] = std::move(node);
     }
 
-    // Topological sort (Kahn's algorithm)
-    std::map<std::string, int> in_degree;
-    std::map<std::string, std::vector<std::string>> adj;
-
-    for (auto& [name, node] : graph.nodes) {
-        in_degree[name] = 0;
-    }
-
-    for (auto& [name, node] : graph.nodes) {
-        for (auto& dep : node.aur_deps) {
-            if (graph.nodes.find(dep) != graph.nodes.end()) {
-                in_degree[name]++;
-                adj[dep].push_back(name);
-            }
-        }
-    }
-
-    // Sorted queue for deterministic output
-    std::vector<std::string> queue;
-    for (auto& [name, deg] : in_degree) {
-        if (deg == 0) queue.push_back(name);
-    }
-    std::sort(queue.begin(), queue.end());
-
-    while (!queue.empty()) {
-        std::sort(queue.begin(), queue.end());
-        auto current = queue.front();
-        queue.erase(queue.begin());
-        graph.build_order.push_back(current);
-
-        if (adj.find(current) != adj.end()) {
-            for (auto& dependent : adj[current]) {
-                in_degree[dependent]--;
-                if (in_degree[dependent] == 0) {
-                    queue.push_back(dependent);
-                }
-            }
-        }
-    }
-
-    // Handle cycles
-    if (static_cast<int>(graph.build_order.size()) < static_cast<int>(graph.nodes.size())) {
-        std::vector<std::string> remaining;
-        for (auto& [name, _] : graph.nodes) {
-            if (!std::count(graph.build_order.begin(), graph.build_order.end(), name)) {
-                remaining.push_back(name);
-            }
-        }
-        std::cerr << "warning: circular dependency among: ";
-        for (size_t i = 0; i < remaining.size(); ++i) {
-            if (i > 0) std::cerr << ", ";
-            std::cerr << remaining[i];
-        }
-        std::cerr << "\n";
-        for (auto& r : remaining) graph.build_order.push_back(r);
-    }
+    std::map<std::string, std::vector<std::string>> dependency_edges;
+    for (const auto& [name, node] : graph.nodes) dependency_edges[name] = node.aur_deps;
+    const auto schedule = dep_graph::schedule(dependency_edges);
+    graph.build_order = schedule.order;
 
     // Collect satisfied deps
     for (auto& [_, node] : graph.nodes) {
@@ -536,30 +212,8 @@ DepGraph resolve(const std::vector<std::string>& roots,
         }
     }
 
-    // Compute parallel build groups (BFS by dependency depth)
-    std::map<std::string, int> depth;
-    for (auto& name : graph.build_order) {
-        depth[name] = 0;
-    }
-
-    for (auto& [name, node] : graph.nodes) {
-        for (auto& dep : node.aur_deps) {
-            if (depth.find(dep) != depth.end()) {
-                depth[name] = std::max(depth[name], depth[dep] + 1);
-            }
-        }
-    }
-
-    // Group by depth level
-    std::map<int, std::vector<std::string>> groups;
-    for (auto& [name, d] : depth) {
-        groups[d].push_back(name);
-    }
-
-    for (auto& [level, pkgs] : groups) {
-        BuildGroup group{pkgs, level};
-        graph.parallel_groups.push_back(std::move(group));
-    }
+    for (const auto& stage : schedule.stages)
+        graph.parallel_groups.push_back({stage.packages, stage.level});
 
     return graph;
 }
@@ -624,74 +278,85 @@ std::vector<OutOfDatePkg> resolve_out_of_date(
         return cached;
     }
 
-    // Batch-fetch AUR info for all foreign packages in one API call.
-    try {
-        if (!quiet) {
-            std::cout << "==> Checking " << foreign_names.size()
-                      << " foreign package(s) against the AUR..." << std::flush;
-        }
+    // Batch-fetch AUR info for all foreign packages. The AUR rejects
+    // over-long URLs, so split the request into fixed-size chunks.
+    constexpr size_t kRpcBatchSize = 150;
+    if (!quiet) {
+        std::cout << "==> Checking " << foreign_names.size()
+                  << " foreign package(s) against the AUR..." << std::flush;
+    }
 
-        httplib::Client cli("https://aur.archlinux.org");
-        cli.set_connection_timeout(std::chrono::seconds(5));
-        cli.set_read_timeout(std::chrono::seconds(15));
-        cli.set_write_timeout(std::chrono::seconds(5));
+    httplib::Client cli("https://aur.archlinux.org");
+    cli.set_connection_timeout(std::chrono::seconds(5));
+    cli.set_read_timeout(std::chrono::seconds(15));
+    cli.set_write_timeout(std::chrono::seconds(5));
 
+    std::map<std::string, std::string> aur_versions;
+    std::map<std::string, std::string> aur_descs;
+    bool had_failure = false;
+
+    for (size_t offset = 0; offset < foreign_names.size(); offset += kRpcBatchSize) {
+        const size_t end = std::min(offset + kRpcBatchSize, foreign_names.size());
         std::string path = "/rpc?v=5&type=info";
-        for (const auto& name : foreign_names) {
-            path += "&arg[]=" + detail::url_encode(name);
+        for (size_t i = offset; i < end; ++i) {
+            path += "&arg[]=" + detail::url_encode(foreign_names[i]);
         }
 
-        auto res = cli.Get(path);
-        if (!quiet) std::cout << " done\n";
-        if (res && res->status == 200) {
+        try {
+            auto res = cli.Get(path);
+            if (!res || res->status != 200) {
+                had_failure = true;
+                continue;
+            }
             auto data = nlohmann::json::parse(res->body);
-            if (data.contains("results")) {
-                aur_cache::merge_results(data["results"]);
-                aur_cache::note_checked(foreign_names);
-
-                // Build a map of name -> AUR version
-                std::map<std::string, std::string> aur_versions;
-                std::map<std::string, std::string> aur_descs;
-
-                for (auto& item : data["results"]) {
-                    const std::string name = item.value("Name", "");
-                    const std::string version = item.value("Version", "");
-                    if (name.empty() || version.empty()) continue;
-                    aur_versions[name] = version;
-                    if (item.contains("Description") && item.at("Description").is_string()) {
-                        aur_descs[name] = item.at("Description").get<std::string>();
-                    }
-                }
-
-                // Compare versions for each foreign package
-                for (auto& name : foreign_names) {
-                    auto it = aur_versions.find(name);
-                    if (it != aur_versions.end()) {
-                        const auto& installed_ver = installed_versions.at(name);
-
-                        if (!installed_ver.empty() && !it->second.empty()) {
-                            if (compare_versions(it->second, installed_ver) > 0) {
-                                std::string desc;
-                                auto dit = aur_descs.find(name);
-                                if (dit != aur_descs.end()) desc = dit->second;
-
-                                result.push_back({name, installed_ver, it->second, desc});
-                            }
-                        }
-                    }
+            if (!data.contains("results")) continue;
+            aur_cache::merge_results(data["results"]);
+            for (auto& item : data["results"]) {
+                const std::string name = item.value("Name", "");
+                const std::string version = item.value("Version", "");
+                if (name.empty() || version.empty()) continue;
+                aur_versions[name] = version;
+                if (item.contains("Description") && item.at("Description").is_string()) {
+                    aur_descs[name] = item.at("Description").get<std::string>();
                 }
             }
-        } else {
-            std::cerr << "warning: AUR query failed"
-                      << (res ? " with HTTP " + std::to_string(res->status)
-                              : " before receiving a response")
-                      << "; using cached metadata\n";
-            result = std::move(cached);
+        } catch (...) {
+            had_failure = true;
         }
-    } catch (...) {
-        // Batch fetch failed — fall back to cache-only (no network)
-        std::cerr << "warning: AUR batch query failed, using cache only\n";
-        result = std::move(cached);
+    }
+    if (!quiet) std::cout << " done\n";
+
+    if (had_failure) {
+        std::cerr << "warning: one or more AUR queries failed; "
+                     "results for the affected packages fall back to cached metadata\n";
+    } else {
+        aur_cache::note_checked(foreign_names);
+    }
+
+    for (const auto& name : foreign_names) {
+        const auto& installed_ver = installed_versions.at(name);
+        if (installed_ver.empty()) continue;
+
+        auto it = aur_versions.find(name);
+        if (it != aur_versions.end() && !it->second.empty()) {
+            if (compare_versions(it->second, installed_ver) > 0) {
+                std::string desc;
+                if (auto dit = aur_descs.find(name); dit != aur_descs.end()) desc = dit->second;
+                result.push_back({name, installed_ver, it->second, desc});
+            }
+            continue;
+        }
+
+        // No fresh answer for this package — use the cached comparison if we have one.
+        if (had_failure) {
+            if (const auto entry = aur_cache::get(name)) {
+                const auto version = entry->value("Version", std::string{});
+                if (!version.empty() && compare_versions(version, installed_ver) > 0) {
+                    const std::string desc = entry->value("Description", std::string{});
+                    result.push_back({name, installed_ver, version, desc});
+                }
+            }
+        }
     }
 
     return result;

@@ -32,6 +32,14 @@ bool OptConfig::compiler_supports_polly(cli::Compiler c) {
     return c == cli::Compiler::Clang;
 }
 
+/// Check if an optimization mode is active (explicitly enabled or auto + available).
+static bool opt_active(cli::OptMode mode, bool available) {
+    if (mode == cli::OptMode::Enabled) return true;
+    if (mode == cli::OptMode::Disabled) return false;
+    // Auto: enable only if the underlying tool is available.
+    return available;
+}
+
 OptConfig OptConfig::from_cli(const cli::Cli& cli) {
     OptConfig cfg{};
 
@@ -45,27 +53,26 @@ OptConfig OptConfig::from_cli(const cli::Cli& cli) {
         cfg.compiler = cli::Compiler::Gcc;  // default
     }
 
-    // Resolve graphite/polly based on compiler compatibility
-    bool user_graphite = is_enabled(cli.graphite);
-    bool user_polly = is_enabled(cli.polly);
+    // Resolve graphite/polly based on compiler compatibility and availability.
+    const bool graphite_avail = cfg.compiler == cli::Compiler::Gcc &&
+                                find_tool("gcc").has_value();
+    const bool polly_avail = cfg.compiler == cli::Compiler::Clang &&
+                             find_tool("polly-opt").has_value();
 
-    if (user_graphite && user_polly) {
+    cfg.graphite = opt_active(cli.graphite, graphite_avail);
+    cfg.polly = opt_active(cli.polly, polly_avail);
+
+    if (cfg.graphite && cfg.polly) {
         std::cerr << "warning: graphite and polly are incompatible, disabling both\n";
         cfg.graphite = false;
         cfg.polly = false;
-    } else {
-        // Graphite only works with GCC
-        cfg.graphite = user_graphite && cfg.compiler == cli::Compiler::Gcc;
-
-        // Polly only works with Clang
-        cfg.polly = user_polly && cfg.compiler == cli::Compiler::Clang;
     }
 
-    // LTO: enabled if explicitly set or auto + available
-    cfg.lto = is_enabled(cli.lto);
+    // LTO: auto-detect by checking if the compiler supports -flto=auto.
+    cfg.lto = opt_active(cli.lto, find_tool(cfg.compiler == cli::Compiler::Gcc ? "gcc" : "clang").has_value());
 
-    // Mold: enabled if explicitly set, auto, and tool available
-    cfg.mold = is_enabled(cli.mold) && mold_available();
+    // Mold: enabled if explicitly set, auto, and tool available.
+    cfg.mold = opt_active(cli.mold, mold_available());
 
     return cfg;
 }
@@ -104,6 +111,10 @@ std::tuple<std::string, std::string, std::string> OptConfig::apply_flags_to(
         cflags += " " + lto_flag;
         cxxflags += " " + lto_flag;
         ldflags += " " + lto_flag;
+        // GCC needs the linker plugin for full LTO
+        if (compiler == cli::Compiler::Gcc) {
+            ldflags += " -fuse-linker-plugin";
+        }
     }
 
     // Mold linker
@@ -117,6 +128,8 @@ std::tuple<std::string, std::string, std::string> OptConfig::apply_flags_to(
         } else {
             ldflags += " -fuse-ld=mold";
         }
+        // GDB index speeds up symbol lookup in large binaries
+        ldflags += " -Wl,--gdb-index";
     }
 
     // Trim

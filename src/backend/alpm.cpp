@@ -13,8 +13,10 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <system_error>
+#include <unordered_map>
 #include <unordered_set>
 #include <unistd.h>
 #include <signal.h>
@@ -46,52 +48,6 @@ static void require_root() {
     if (geteuid() != 0 && !isolated_root) {
         throw alpm_error("this operation modifies the system; run pacmkr as root");
     }
-}
-
-/// Check for a stale pacman lock file. Returns true when a stale lock is found.
-/// A lock file containing a PID of a non-existent process is considered stale.
-static bool check_stale_lock() {
-    const std::filesystem::path lock_path = "/var/lib/pacman/db.lck";
-    if (!std::filesystem::exists(lock_path)) return false;
-
-    // Read the PID from the lock file (pacman writes its PID)
-    std::ifstream lock_file(lock_path);
-    if (!lock_file) return false;
-
-    std::string pid_str;
-    lock_file >> pid_str;
-    if (pid_str.empty()) {
-        // Empty lock file — definitely stale
-        terminal::warning("Stale lock file detected (empty); removing");
-        std::error_code ec;
-        std::filesystem::remove(lock_path, ec);
-        return true;
-    }
-
-    // Check if the PID is still running
-    int pid;
-    try {
-        pid = std::stoi(pid_str);
-    } catch (...) {
-        terminal::warning("Stale lock file detected (invalid PID '" + pid_str + "'); removing");
-        std::error_code ec;
-        std::filesystem::remove(lock_path, ec);
-        return true;
-    }
-
-    // kill(0) checks if the process exists without actually sending a signal
-    if (kill(pid, 0) != 0 && errno == ESRCH) {
-        terminal::warning("Stale lock file detected (PID " + std::to_string(pid)
-                          + " not running); removing");
-        std::error_code ec;
-        std::filesystem::remove(lock_path, ec);
-        return true;
-    }
-
-    // Process is still running — another package manager may be active
-    terminal::warning("Lock file exists (PID " + std::to_string(pid)
-                      + " is running). Another package manager may be in use.");
-    return false;
 }
 
 static std::string last_error(const std::string& action) {
@@ -167,67 +123,102 @@ static void progress_callback(void*, alpm_progress_t event, const char* pkg,
     terminal::progress(label, percent, current, total, done);
 }
 
-/// Turn a raw download filename into something readable for the progress line.
-/// Package archives (name-ver-rel-arch.pkg.tar.zst[.sig]) collapse to just the
-/// package name plus a "(sig)" marker; database files (foo.db[.sig]) are left
-/// alone since they are already short and recognisable.
-static std::string download_display_name(const std::string& filename) {
-    std::string name = filename;
-    bool is_signature = false;
-    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".sig") == 0) {
-        is_signature = true;
-        name.resize(name.size() - 4);
-    }
-    const auto pkg = name.find(".pkg.tar");
-    if (pkg == std::string::npos) return filename;  // database files: leave as-is
-    name.resize(pkg);
-    // Drop the trailing pkgver-pkgrel-arch fields (none may contain '-').
-    for (int i = 0; i < 3; ++i) {
-        const auto dash = name.rfind('-');
-        if (dash == std::string::npos) break;
-        name.resize(dash);
-    }
-    if (is_signature) name += " (sig)";
-    return name;
+/// Base name for grouping: strip .sig suffix so "foo.db.sig" → "foo.db".
+static std::string group_key(const std::string& filename) {
+    auto key = filename;
+    if (key.size() >= 4 && key.compare(key.size() - 4, 4, ".sig") == 0)
+        key.resize(key.size() - 4);
+    return key;
 }
+
+/// Track a group of downloads that should share one progress bar.
+struct DownloadGroup {
+    std::string display_name;       // e.g. "core" or "cachyos-extra-v3"
+    size_t total = 0;               // combined total bytes for all files in group
+    size_t downloaded = 0;          // combined downloaded bytes
+    int completed_files = 0;        // how many files have finished
+    int started_files = 0;          // how many files have been seen (ALPM_DOWNLOAD_INIT)
+    std::string status;             // final status text: "up to date", "downloaded", etc.
+};
+
+/// Groups keyed by base filename. Lives across callback invocations.
+static std::unordered_map<std::string, DownloadGroup> download_groups;
+static std::string current_group_key;  // the group currently being shown
 
 static void download_callback(void*, const char* filename,
                               alpm_download_event_type_t event, void* data) {
     const std::string raw = filename ? filename : "database";
-    const std::string display = download_display_name(raw);
-    const char* name = display.c_str();
     const bool is_signature = raw.size() >= 4 &&
         raw.compare(raw.size() - 4, 4, ".sig") == 0;
+    const auto key = group_key(raw);
+
+    // For database files, show a short display name (strip .db/.db.sig)
+    std::string display = raw;
+    if (!is_signature && raw.size() >= 4 && raw.compare(raw.size() - 4, 4, ".db") == 0) {
+        display = raw.substr(0, raw.size() - 4);
+    } else if (is_signature && raw.size() >= 8 &&
+               raw.compare(raw.size() - 8, 8, ".db.sig") == 0) {
+        display = raw.substr(0, raw.size() - 8);
+    }
+
     switch (event) {
-        case ALPM_DOWNLOAD_INIT:
-            terminal::progress(name, 0);
+        case ALPM_DOWNLOAD_INIT: {
+            auto& grp = download_groups[key];
+            if (grp.started_files == 0)
+                grp.display_name = display;
+            grp.started_files++;
+            current_group_key = key;
             break;
+        }
         case ALPM_DOWNLOAD_PROGRESS: {
             const auto* progress = static_cast<alpm_download_event_progress_t*>(data);
             if (progress && progress->total > 0) {
-                const auto percent = static_cast<int>(100 * progress->downloaded / progress->total);
-                terminal::progress(name, percent);
+                auto it = download_groups.find(key);
+                if (it != download_groups.end()) {
+                    // Accumulate total and downloaded across all files in group
+                    it->second.total += static_cast<size_t>(progress->total);
+                    it->second.downloaded += static_cast<size_t>(progress->downloaded);
+                }
+                const auto& grp = download_groups[key];
+                if (grp.total > 0) {
+                    const auto percent = static_cast<int>(100 * grp.downloaded / grp.total);
+                    terminal::progress(grp.display_name, percent);
+                } else {
+                    // Single-file fallback
+                    const auto percent = static_cast<int>(100 * progress->downloaded / progress->total);
+                    terminal::progress(display, percent);
+                }
             }
             break;
         }
         case ALPM_DOWNLOAD_RETRY:
-            terminal::warning(std::string("Retrying ") + name + " with another mirror");
+            terminal::warning(std::string("Retrying ") + display + " with another mirror");
             break;
         case ALPM_DOWNLOAD_COMPLETED: {
             const auto* completed = static_cast<alpm_download_event_completed_t*>(data);
             const bool current = completed && completed->result == 1;
             const bool failed = completed && completed->result < 0;
+
+            auto& grp = download_groups[key];
+            grp.completed_files++;
+
             if (failed && is_signature) {
-                // Repositories that don't sign their databases (the official Arch
-                // repos, with the default DatabaseOptional policy) return 404 for
-                // the detached signature. libalpm keeps the database when the
-                // signature is optional; a genuinely required signature failure
-                // aborts alpm_db_update and surfaces as a thrown error instead.
-                terminal::progress(name, 100, 0, 0, true, "no signature");
-                break;
+                // Unsigned repo: mark this file done, but don't block the group.
+                grp.status = "no signature";
+            } else if (failed) {
+                grp.status = "failed";
+            } else if (current) {
+                grp.status = "up to date";
+            } else {
+                grp.status = "downloaded";
             }
-            terminal::progress(name, failed ? 0 : 100, 0, 0, true,
-                               failed ? "failed" : (current ? "up to date" : "downloaded"));
+
+            // When all files in the group are done, show final status.
+            if (grp.completed_files >= grp.started_files) {
+                terminal::progress(grp.display_name, 100, 0, 0, true, grp.status);
+                download_groups.erase(key);
+                current_group_key.clear();
+            }
             break;
         }
     }
@@ -236,7 +227,6 @@ static void download_callback(void*, const char* filename,
 struct Transaction {
     explicit Transaction(int flags, bool no_confirm) {
         require_root();
-        check_stale_lock();
         g_no_confirm = no_confirm;
         if (alpm_trans_init(g_handle, flags) < 0) throw alpm_error(last_error("cannot start transaction"));
     }
@@ -318,11 +308,6 @@ static std::vector<std::string> deps_to_strings(alpm_list_t* list) {
         }
     }
     return result;
-}
-
-static std::string dep_to_string(const alpm_depend_t* dep) {
-    if (!dep || !dep->name) return {};
-    return dep->name;
 }
 
 static std::string trim(std::string value) {
@@ -663,7 +648,13 @@ void init(const std::string& root, const std::string& db_path, const std::string
     alpm_option_set_remote_file_siglevel(g_handle, options.remote_file_sig_level.empty()
         ? default_siglevel : signature_level(options.remote_file_sig_level));
     auto repositories = config.repositories;
-    if (repositories.empty()) repositories = {{"core"}, {"extra"}, {"multilib"}};
+    if (repositories.empty()) {
+        repositories = {
+            {"core", {}, {"All"}},
+            {"extra", {}, {"All"}},
+            {"multilib", {}, {"All"}},
+        };
+    }
     for (const auto& repository : repositories) {
         const int siglevel = repository.sig_level.empty()
             ? ALPM_SIG_USE_DEFAULT : signature_level(repository.sig_level, default_siglevel);
@@ -1116,6 +1107,30 @@ std::vector<std::string> missing_dependencies(const std::vector<std::string>& de
     return missing;
 }
 
+int vercmp(const std::string& a, const std::string& b) {
+    const int result = alpm_pkg_vercmp(a.c_str(), b.c_str());
+    return result < 0 ? -1 : (result > 0 ? 1 : 0);
+}
+
+std::optional<std::string> local_satisfier(const std::string& dep_spec) {
+    if (!g_handle) throw alpm_error("libalpm not initialized");
+    auto* packages = alpm_db_get_pkgcache(alpm_get_localdb(g_handle));
+    auto* satisfier = alpm_find_satisfier(packages, dep_spec.c_str());
+    if (!satisfier) return std::nullopt;
+    return std::string(alpm_pkg_get_name(satisfier));
+}
+
+std::optional<std::string> sync_satisfier(const std::string& dep_spec) {
+    if (!g_handle) throw alpm_error("libalpm not initialized");
+    for (auto* db_item = alpm_get_syncdbs(g_handle); db_item; db_item = db_item->next) {
+        auto* db = static_cast<alpm_db_t*>(db_item->data);
+        if (!db) continue;
+        auto* satisfier = alpm_find_satisfier(alpm_db_get_pkgcache(db), dep_spec.c_str());
+        if (satisfier) return std::string(alpm_pkg_get_name(satisfier));
+    }
+    return std::nullopt;
+}
+
 int set_install_reason(const std::vector<std::string>& packages, bool explicit_reason) {
     require_root();
     auto* local = alpm_get_localdb(g_handle);
@@ -1194,6 +1209,48 @@ std::vector<Package> get_explicit_packages() {
         }
         return result;
     } catch (...) { return {}; }
+}
+
+/// Extract the package name from a dependency spec (strips version constraints).
+static std::string parse_dep_spec_alpm(const std::string& spec) {
+    for (char sep : {'>', '<', '='}) {
+        auto pos = spec.find(sep);
+        if (pos != std::string::npos) return spec.substr(0, pos);
+    }
+    return spec;
+}
+
+int install_sync_packages(const std::vector<std::string>& makedeps,
+                          const std::vector<std::string>& checkdeps,
+                          bool no_confirm) {
+    // Collect all build dependencies.
+    std::set<std::string> all_deps;
+    for (const auto& dep : makedeps) all_deps.insert(dep);
+    for (const auto& dep : checkdeps) all_deps.insert(dep);
+
+    if (all_deps.empty()) return 0;  // Nothing to install.
+
+    // Filter out already-installed packages and packages from official repos.
+    std::vector<std::string> to_install;
+    for (const auto& dep : all_deps) {
+        const auto name = parse_dep_spec_alpm(dep);
+        if (name.empty()) continue;
+        
+        // Check if already installed (honors version constraints via full spec).
+        if (local_satisfier(dep).has_value()) continue;
+        
+        to_install.push_back(name);
+    }
+
+    if (to_install.empty()) return 0;  // All deps satisfied.
+
+    terminal::info("Installing " + std::to_string(to_install.size()) +
+                   " build dependency(ies)...");
+    for (const auto& pkg : to_install) {
+        std::cout << "  - " << pkg << "\n";
+    }
+
+    return install(to_install, /*needed=*/false, no_confirm);
 }
 
 } // namespace pacmkr::alpm

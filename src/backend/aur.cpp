@@ -155,31 +155,81 @@ nlohmann::json aur_get(const std::string& path) {
     throw source_error("AUR request failed after retries");
 }
 
-std::filesystem::path clone_aur_repo(const std::string& pkgname,
-                                      const std::filesystem::path& dest) {
+/// Path to the shared bare mirror of the AUR Git repository.
+static std::filesystem::path get_aur_mirror_path() {
+    const char* xdg_cache = std::getenv("XDG_CACHE_HOME");
+    if (xdg_cache && std::string(xdg_cache).size() > 0)
+        return std::filesystem::path{xdg_cache} / "pacmkr" / "aur.git";
+    const char* home = std::getenv("HOME");
+    if (!home) return std::filesystem::temp_directory_path() / "pacmkr" / "aur.git";
+    return std::filesystem::path{home} / ".cache" / "pacmkr" / "aur.git";
+}
+
+/// Initialize or update the shared bare AUR mirror.
+static void ensure_aur_mirror() {
+    auto mirror_path = get_aur_mirror_path();
+    std::filesystem::create_directories(mirror_path);
+
+    const bool exists = std::filesystem::exists(mirror_path / ".git");
+    if (!exists) {
+        terminal::info("Initializing AUR Git mirror...");
+        if (run_process({"git", "init", "--bare", mirror_path.string()}) != 0)
+            throw source_error("Failed to initialize AUR Git mirror");
+    }
+
+    // Update the bare mirror from AUR.
+    // If this is a fresh clone, use --mirror for full fetch; otherwise just fetch.
+    const bool was_empty = exists && std::filesystem::is_empty(mirror_path);
+    if (was_empty) {
+        terminal::info("Cloning AUR Git mirror (this may take a while)...");
+        if (run_process({"git", "clone", "--mirror", "--quiet",
+                         "https://aur.archlinux.org/aur.git",
+                         mirror_path.string()}) != 0)
+            throw source_error("Failed to clone AUR Git mirror");
+    } else {
+        terminal::info("Updating AUR Git mirror...");
+        if (run_process({"git", "-C", mirror_path.string(), "fetch", "--prune", "--quiet",
+                         "https://aur.archlinux.org/aur.git", "+refs/*:refs/*"}) != 0) {
+            // Mirror update failure is non-fatal — we can still checkout from it
+            std::cerr << "warning: AUR Git mirror update failed, using stale mirror\n";
+        }
+    }
+}
+
+/// Checkout a specific package branch from the bare mirror into a working directory.
+static std::filesystem::path checkout_from_mirror(const std::string& pkgname,
+                                                   const std::filesystem::path& dest) {
+    auto mirror_path = get_aur_mirror_path();
     auto pkgdir = dest / pkgname;
 
+    // If we already have this package, fast-forward from the mirror.
     if (std::filesystem::exists(pkgdir)) {
         if (!std::filesystem::is_directory(pkgdir / ".git"))
             throw source_error("Existing path is not an AUR Git repository: " + pkgdir.string());
         terminal::info("Updating " + pkgname);
+        // Update remote to point at the mirror, then fetch and merge.
+        if (run_process({"git", "-C", pkgdir.string(), "remote", "set-url",
+                         "origin", mirror_path.string()}) != 0)
+            throw source_error("Failed to update AUR repository origin");
         if (run_process({"git", "-C", pkgdir.string(), "pull", "--ff-only"}) != 0) {
-            throw source_error("Failed to update existing AUR repository for " + pkgname);
+            // If fast-forward fails, do a fresh checkout from mirror.
+            std::filesystem::remove_all(pkgdir);
+            goto fresh_checkout;
         }
     } else {
+fresh_checkout:
         terminal::info("Cloning " + pkgname);
-        if (run_process({"git", "clone", "--depth", "1", "--",
-                         "https://aur.archlinux.org/" + pkgname + ".git",
-                         pkgdir.string()}) != 0) {
+        // Clone from the bare mirror (local operation, very fast).
+        if (run_process({"git", "clone", "--depth", "1",
+                         "file://" + mirror_path.string(),
+                         pkgdir.string()}) != 0)
             throw source_error("Failed to clone AUR repository for " + pkgname);
-        }
     }
 
     auto pkgbuild_path = pkgdir / "PKGBUILD";
     if (!std::filesystem::exists(pkgbuild_path)) {
         throw source_error("No PKGBUILD found in AUR package '" + pkgname + "'");
     }
-
     return pkgbuild_path;
 }
 
@@ -231,36 +281,102 @@ AurPackageInfo fetch(const std::string& pkgname) {
     return info_from_json(data["results"][0]);
 }
 
+// Maximum package names per AUR RPC request. The AUR rejects over-long URLs
+// (roughly 8 KB); 150 names keeps every request comfortably under that even
+// with long package names, and matches what other helpers use.
+static constexpr size_t kRpcBatchSize = 150;
+
 std::vector<AurPackageInfo> fetch_batch(const std::vector<std::string>& pkgnames) {
     if (pkgnames.empty()) return {};
 
-    // Build batch path: /rpc?v=5&type=info&arg[]=foo&arg[]=bar...
-    std::string path = "/rpc?v=5&type=info";
-    for (const auto& name : pkgnames) {
-        path += "&arg[]=" + detail::url_encode(name);
-    }
-
-    auto data = aur_get(path);
-
-    if (!data.contains("results") || !data["results"].is_array()) {
-        return {};
-    }
-
     std::vector<AurPackageInfo> results;
-    results.reserve(data["results"].size());
-    for (auto& item : data["results"]) {
-        if (item.contains("Name") && item["Name"].is_string()) {
-            results.push_back(info_from_json(item));
+    results.reserve(pkgnames.size());
+    bool any_ok = false;
+    std::string last_error;
+
+    for (size_t offset = 0; offset < pkgnames.size(); offset += kRpcBatchSize) {
+        const size_t end = std::min(offset + kRpcBatchSize, pkgnames.size());
+
+        // Build chunk path: /rpc?v=5&type=info&arg[]=foo&arg[]=bar...
+        std::string path = "/rpc?v=5&type=info";
+        for (size_t i = offset; i < end; ++i) {
+            path += "&arg[]=" + detail::url_encode(pkgnames[i]);
         }
+
+        nlohmann::json data;
+        try {
+            data = aur_get(path);
+        } catch (const source_error& e) {
+            last_error = e.what();
+            continue;  // keep going — a later chunk may still succeed
+        }
+        any_ok = true;
+
+        if (!data.contains("results") || !data["results"].is_array()) continue;
+        for (auto& item : data["results"]) {
+            if (item.contains("Name") && item["Name"].is_string()) {
+                results.push_back(info_from_json(item));
+            }
+        }
+    }
+
+    // Only fail outright when every chunk failed; a partial result is still
+    // useful for dependency resolution.
+    if (!any_ok) {
+        throw source_error(last_error.empty() ? "AUR batch info request failed"
+                                              : last_error);
     }
     return results;
 }
 
+std::vector<std::string> providers(const std::string& dep) {
+    std::string name = dep;
+    for (const char sep : {'>', '<', '='}) {
+        if (const auto pos = name.find(sep); pos != std::string::npos) {
+            name = name.substr(0, pos);
+        }
+    }
+    if (name.empty()) return {};
+
+    nlohmann::json data;
+    try {
+        data = aur_get("/rpc?v=5&type=search&by=provides&arg=" + detail::url_encode(name));
+    } catch (const source_error&) {
+        return {};
+    }
+    if (!data.contains("results") || !data["results"].is_array()) return {};
+
+    struct Candidate { std::string base; unsigned int votes; bool exact; };
+    std::vector<Candidate> candidates;
+    for (auto& item : data["results"]) {
+        auto pkg = pkg_from_json(item);
+        const std::string& base = pkg.pkgname.empty() ? pkg.name : pkg.pkgname;
+        if (base.empty()) continue;
+        candidates.push_back({base, pkg.numvotes, pkg.name == name});
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) {
+                  if (a.exact != b.exact) return a.exact;
+                  return a.votes > b.votes;
+              });
+
+    std::vector<std::string> bases;
+    for (const auto& candidate : candidates) {
+        if (std::find(bases.begin(), bases.end(), candidate.base) == bases.end()) {
+            bases.push_back(candidate.base);
+        }
+    }
+    return bases;
+}
+
 std::filesystem::path download_pkgbuild(const std::string& pkgname,
                                          const std::filesystem::path& dest) {
+    // Initialize the shared bare mirror (first time or update).
+    ensure_aur_mirror();
+    
     // Ensure destination exists
     std::filesystem::create_directories(dest);
-    return clone_aur_repo(pkgname, dest);
+    return checkout_from_mirror(pkgname, dest);
 }
 
 bool is_official_package(const std::string& pkgname) {
@@ -328,7 +444,7 @@ void search_aur(const std::string& query, unsigned int limit, bool json_mode) {
         std::getline(std::cin, input);
 
         try {
-            unsigned int idx = std::stoul(input) - 1;
+            const size_t idx = std::stoul(input) - 1;
             if (idx < count) {
                 auto& pkg = results[idx];
                 std::cout << "\n==> Selected: " << pkg.name << "\n";

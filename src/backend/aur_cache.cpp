@@ -1,6 +1,7 @@
 #include "pacmkr/backend/aur_cache.h"
 #include "pacmkr/core/error.h"
 #include "pacmkr/core/fuzzy_search.h"
+#include "pacmkr/app/terminal.h"
 
 #include <map>
 #include <httplib.h>
@@ -33,7 +34,7 @@ static std::filesystem::path get_cache_path() {
     return base / ".cache" / "pacmkr" / "aur-cache.json";
 }
 
-/// Fetch all AUR packages via the RPC API.
+/// Fetch all AUR packages via the RPC API (full refresh).
 static json fetch_all_packages() {
     static httplib::Client cli("https://aur.archlinux.org");
     cli.set_connection_timeout(std::chrono::seconds(10));
@@ -164,6 +165,61 @@ static bool cache_is_stale() {
     return std::filesystem::file_time_type::clock::now() - modified > kCheckTtl;
 }
 
+/// Incrementally update the cache by fetching only stale packages.
+static void incremental_update() {
+    static httplib::Client cli("https://aur.archlinux.org");
+    cli.set_connection_timeout(std::chrono::seconds(5));
+    cli.set_read_timeout(std::chrono::seconds(15));
+
+    // Collect packages that are stale (checked > 3 hours ago or never checked).
+    std::vector<std::string> stale_names;
+    const long long now = now_unix();
+    const long long ttl_seconds =
+        std::chrono::duration_cast<std::chrono::seconds>(kCheckTtl).count();
+    for (auto& [name, ts] : g_checked) {
+        if (now - ts > ttl_seconds) {
+            stale_names.push_back(name);
+        }
+    }
+
+    if (stale_names.empty()) return;  // Everything is fresh.
+
+    terminal::info("Refreshing " + std::to_string(stale_names.size()) +
+                   " stale AUR package(s)...");
+
+    // Batch-fetch stale packages (150 per request).
+    // Do NOT call merge_results here — it calls save_to_disk() which would
+    // write stale timestamps to disk before we update g_checked.  Instead,
+    // update g_aur_data inline and do a single save at the end.
+    constexpr size_t kBatchSize = 150;
+    for (size_t offset = 0; offset < stale_names.size(); offset += kBatchSize) {
+        const size_t end = std::min(offset + kBatchSize, stale_names.size());
+        std::string path = "/rpc?v=5&type=info";
+        for (size_t i = offset; i < end; ++i) {
+            path += "&arg[]=" + detail::url_encode(stale_names[i]);
+        }
+
+        try {
+            auto res = cli.Get(path.c_str());
+            if (!res || res->status != 200) continue;
+            auto data = json::parse(res->body);
+            if (!data.contains("results") || !data["results"].is_array()) continue;
+            for (auto& pkg : data["results"]) {
+                const auto name = pkg.value("Name", std::string{});
+                if (!name.empty()) g_aur_data[name] = pkg;
+            }
+        } catch (...) {
+            // Ignore individual batch failures.
+        }
+    }
+
+    // Mark all stale packages as just-checked and save once at the end.
+    for (auto& name : stale_names) {
+        g_checked[name] = now;
+    }
+    save_to_disk();
+}
+
 // ─── Public API ──────────────────────────────────────────────────────
 
 void init(bool force_refresh) {
@@ -172,9 +228,8 @@ void init(bool force_refresh) {
     // Load from disk first
     g_loaded_from_disk = load_from_disk();
 
-    // Normal startup is disk-only. Upgrade checks refresh just the installed
-    // foreign packages, avoiding a large global AUR request on the hot path.
     if (force_refresh) {
+        // Full refresh: fetch all packages and replace the cache.
         try {
             json response = fetch_all_packages();
             if (response.contains("results") && response["results"].is_array()) {
@@ -194,6 +249,9 @@ void init(bool force_refresh) {
                 std::cerr << "warning: no cached data available\n";
             }
         }
+    } else {
+        // Incremental update: only fetch stale packages.
+        incremental_update();
     }
 
     g_initialized = true;

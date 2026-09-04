@@ -22,8 +22,19 @@ struct Package {
                        const std::string& packager,
                        uint64_t builddate) const;
 
-    /// Create the final .pkg.tar.zst archive using bsdtar.
-    void create_archive(const std::filesystem::path& pkgdir) const;
+    /// Write Arch build provenance metadata.
+    void write_buildinfo(const pkgbuild::Pkgbuild& pkgbuild,
+                         const std::filesystem::path& pkgdir,
+                         const std::string& packager,
+                         uint64_t builddate,
+                         const std::filesystem::path& builddir,
+                         const std::vector<std::string>& buildenv,
+                         const std::vector<std::string>& options,
+                         const std::vector<std::string>& installed) const;
+
+    /// Create .MTREE and the final reproducible .pkg.tar.zst archive.
+    void create_archive(const std::filesystem::path& pkgdir,
+                        uint64_t source_date_epoch = 0) const;
 };
 
 /// Calculate directory size in bytes.

@@ -6,16 +6,15 @@
 #include <filesystem>
 #include <iostream>
 #include <algorithm>
+#include <array>
+#include <cerrno>
+#include <ctime>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace pacmkr::package {
 
 namespace {
-
-std::string shell_quote(const std::string& value) {
-    std::string result{"'"};
-    for (char c : value) result += c == '\'' ? "'\\''" : std::string(1, c);
-    return result + "'";
-}
 
 uint64_t calc_dir_size(const std::filesystem::path& path) {
     uint64_t size = 0;
@@ -29,17 +28,80 @@ uint64_t calc_dir_size(const std::filesystem::path& path) {
     return size;
 }
 
+int run_process(const std::vector<std::string>& arguments, std::string* output = nullptr) {
+    if (arguments.empty()) return 127;
+    int descriptors[2]{-1, -1};
+    if (output && pipe(descriptors) < 0) return 127;
+    const pid_t child = fork();
+    if (child < 0) {
+        if (output) { close(descriptors[0]); close(descriptors[1]); }
+        return 127;
+    }
+    if (child == 0) {
+        if (output) {
+            close(descriptors[0]);
+            if (dup2(descriptors[1], STDOUT_FILENO) < 0) _exit(127);
+            close(descriptors[1]);
+        }
+        std::vector<char*> argv;
+        argv.reserve(arguments.size() + 1);
+        for (const auto& argument : arguments)
+            argv.push_back(const_cast<char*>(argument.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv.front(), argv.data());
+        _exit(127);
+    }
+    if (output) {
+        close(descriptors[1]);
+        std::array<char, 4096> buffer{};
+        for (ssize_t count; (count = read(descriptors[0], buffer.data(), buffer.size())) > 0;)
+            output->append(buffer.data(), static_cast<size_t>(count));
+        close(descriptors[0]);
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128;
+}
+
+int run_packaging_script(const char* script, const std::filesystem::path& pkgdir,
+                         const std::string& argument, bool save_fakeroot_state) {
+    const auto state = pkgdir / ".PACMKR_FAKEROOT";
+    std::vector<std::string> command;
+    if (std::filesystem::exists(state)) {
+        command = {"fakeroot", "-i", state.string()};
+        if (save_fakeroot_state) {
+            command.push_back("-s");
+            command.push_back(state.string());
+        }
+        command.push_back("--");
+    }
+    command.insert(command.end(), {"bash", "--noprofile", "--norc", "-o", "pipefail",
+                                    "-c", script, "pacmkr-package", pkgdir.string(),
+                                    argument, state.string()});
+    return run_process(command);
+}
+
+std::string sha256_file(const std::filesystem::path& path) {
+    std::string output;
+    if (path.empty() || run_process({"sha256sum", "--", path.string()}, &output) != 0)
+        throw package_error("Cannot hash PKGBUILD: " + path.string());
+    const auto separator = output.find_first_of(" \t\r\n");
+    if (separator == std::string::npos) throw package_error("Invalid sha256sum output");
+    return output.substr(0, separator);
+}
+
 std::string escape_pkginfo(const std::string& s) {
     std::string result;
+    bool pending_space = false;
     for (char c : s) {
-        if (c == '\n') result += ' ';
-        else if (!std::isspace(static_cast<unsigned char>(c))) result += c;
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            pending_space = !result.empty();
+        } else {
+            if (pending_space) result += ' ';
+            result += c;
+            pending_space = false;
+        }
     }
-    // Trim
-    auto start = result.find_first_not_of(" \t");
-    if (start != std::string::npos) result = result.substr(start);
-    auto end = result.find_last_not_of(" \t");
-    if (end != std::string::npos) result = result.substr(0, end + 1);
     return result;
 }
 
@@ -88,17 +150,62 @@ void Package::write_pkginfo(const pkgbuild::Pkgbuild& pb,
     out.close();
 }
 
-void Package::create_archive(const std::filesystem::path& pkgdir) const {
+void Package::write_buildinfo(const pkgbuild::Pkgbuild& pb,
+                              const std::filesystem::path& pkgdir,
+                              const std::string& packager,
+                              uint64_t builddate,
+                              const std::filesystem::path& builddir,
+                              const std::vector<std::string>& buildenv,
+                              const std::vector<std::string>& options,
+                              const std::vector<std::string>& installed) const {
+    std::ofstream out(pkgdir / ".BUILDINFO");
+    if (!out) throw package_error("Cannot write .BUILDINFO");
+    const auto package_base = pb.pkgbase_opt.has_value()
+        ? *pb.pkgbase_opt : (pb.pkgname.empty() ? "unknown" : pb.pkgname.front());
+    out << "format = 2\n"
+        << "pkgname = " << name << "\n"
+        << "pkgbase = " << package_base << "\n"
+        << "pkgver = " << version << "\n"
+        << "pkgarch = " << arch << "\n"
+        << "pkgbuild_sha256sum = " << sha256_file(pb.source_path) << "\n"
+        << "packager = " << escape_pkginfo(packager) << "\n"
+        << "builddate = " << builddate << "\n"
+        << "builddir = " << builddir.string() << "\n"
+        << "startdir = " << pb.source_path.parent_path().string() << "\n"
+        << "buildtool = pacmkr\n"
+        << "buildtoolver = 0.1.0\n";
+    for (const auto& value : buildenv) out << "buildenv = " << value << "\n";
+    for (const auto& value : options) out << "options = " << value << "\n";
+    for (const auto& value : installed) out << "installed = " << value << "\n";
+}
+
+void Package::create_archive(const std::filesystem::path& pkgdir,
+                             uint64_t source_date_epoch) const {
     std::cout << "==> Compressing package...\n";
+    if (source_date_epoch == 0) source_date_epoch = static_cast<uint64_t>(std::time(nullptr));
+    const auto epoch = std::to_string(source_date_epoch);
+    static constexpr char create_mtree[] = R"BASH(
+cd "$1" || exit $?
+find . -exec touch -h -d "@$2" {} + || exit $?
+find . -mindepth 1 ! -name .MTREE ! -name .PACMKR_FAKEROOT -printf '%P\0' |
+    LC_ALL=C sort -z |
+    bsdtar -cnf - --format=mtree \
+        --options='!all,use-set,type,uid,gid,mode,time,size,sha256,link' \
+        --null --files-from - | gzip -c -f -n > .MTREE || exit $?
+touch -h -d "@$2" .MTREE
+)BASH";
+    if (run_packaging_script(create_mtree, pkgdir, epoch, true) != 0)
+        throw package_error("Failed to create .MTREE");
 
-    // Arch package names ending in .zst must contain a zstd stream.
-    const std::string command = "bsdtar --no-fflags --no-read-sparse -cf - -s ',^\\./,,' -C " +
-        shell_quote(pkgdir.string()) + " . | zstd -q -T0 -o " + shell_quote(dest.string());
-    int rc = std::system(command.c_str());
-
-    if (rc != 0) {
-        throw package_error("bsdtar failed to create package archive");
-    }
+    static constexpr char create_package[] = R"BASH(
+cd "$1" || exit $?
+rm -f "$3"
+find . -mindepth 1 -printf '%P\0' | LC_ALL=C sort -z |
+    bsdtar --no-fflags --no-read-sparse -cnf - --null --files-from - |
+    zstd -q -T0 -f -o "$2"
+)BASH";
+    if (run_packaging_script(create_package, pkgdir, dest.string(), false) != 0)
+        throw package_error("Failed to create package archive");
 
     std::cout << "==> Package created: " << dest.string() << "\n";
 }

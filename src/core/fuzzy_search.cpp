@@ -77,11 +77,6 @@ static int levenshtein_dist(const std::string& a, const std::string& b) {
     return prev[n];
 }
 
-/// Check if query is a substring of text (case-insensitive).
-static bool contains_substring(const std::string& query, const std::string& text) {
-    return text.find(query) != std::string::npos;
-}
-
 /// Score an exact substring match with position bonus.
 static double score_substring(const std::string& query, const std::string& text) {
     size_t pos = text.find(query);

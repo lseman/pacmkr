@@ -1,4 +1,5 @@
 #include "pacmkr/backend/alpm.h"
+#include "pacmkr/build/pkgbuild.h"
 #include "pacmkr/core/package.h"
 
 #include <algorithm>
@@ -42,6 +43,24 @@ int main() {
     fs::create_directories(root);
     fs::create_directories(db);
     fs::create_directories(cache);
+
+    // Package metadata must preserve word boundaries while normalizing
+    // whitespace to the single-line .PKGINFO representation.
+    {
+        const auto metadata_dir = base / "metadata";
+        fs::create_directories(metadata_dir);
+        pacmkr::pkgbuild::Pkgbuild definition;
+        definition.pkgname = {"metadata-test"};
+        definition.pkgver = "1";
+        definition.pkgrel = "1";
+        definition.desc = "  native   optimized\npackage  ";
+        const auto metadata = pacmkr::package::Package::make(
+            "metadata-test", "1-1", "any", base);
+        metadata.write_pkginfo(definition, metadata_dir, "pacmkr tests", 1);
+        std::ifstream input(metadata_dir / ".PKGINFO");
+        const std::string contents((std::istreambuf_iterator<char>(input)), {});
+        assert(contents.find("pkgdesc = native optimized package\n") != std::string::npos);
+    }
 
     std::ofstream(config)
         << "[options]\n"

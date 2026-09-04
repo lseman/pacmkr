@@ -4,9 +4,13 @@
 #include "pacmkr/core/config.h"
 #include "pacmkr/build/pkgbuild.h"
 
+#include <string>
+#include <vector>
+#include <filesystem>
+
 namespace pacmkr::build {
 
-/// Orchestrate the build process: prepare, build, check.
+/// Orchestrate the build process via makepipe with our optimization flags.
 struct BuildOrchestrator {
     const cli::Cli& cli;
     const config::Config& config;
@@ -15,27 +19,23 @@ struct BuildOrchestrator {
     BuildOrchestrator(const cli::Cli& cli, const config::Config& config,
                       pkgbuild::Pkgbuild pkgbuild);
 
-    /// Run the full build pipeline with retry support.
+    /// Run the full build pipeline (delegates to makepipe).
     int run();
 
     /// Get the package version string.
     std::string version() const;
-
-    /// Number of retries attempted (set by run()).
-    int retries_attempted() const { return retries_; }
 
     /// Total build duration in milliseconds (set by run()).
     int total_duration_ms() const { return static_cast<int>(total_duration_.count()); }
 
 private:
     std::filesystem::path log_dir_{};
-    int retries_{0};
     std::chrono::milliseconds total_duration_;
     void setup_environment();
-    int run_function(const std::string& func_name, const std::filesystem::path& srcdir,
-                     const std::filesystem::path& pkgdir = {}, bool fakeroot = false);
-    int run_with_retry(const std::string& func_name, const std::filesystem::path& srcdir,
-                       const std::filesystem::path& pkgdir = {}, bool fakeroot = false);
+    
+    /// Execute makepipe with the given arguments, capturing output to log_file.
+    int execute_makepipe(const std::vector<std::string>& args,
+                         const std::filesystem::path& log_file);
 };
 
 /// Check that required tools are available.

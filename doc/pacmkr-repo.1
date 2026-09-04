@@ -1,0 +1,70 @@
+.TH PACMKR-REPO 1 "2026-09-03" "pacmkr 0.1.0" "pacmkr Manual"
+.SH NAME
+pacmkr\-repo \- manage a local pacman package repository
+.SH SYNOPSIS
+.B pacmkr\-repo
+.I command
+.RI [ arguments ...]
+.SH DESCRIPTION
+.B pacmkr\-repo
+creates and maintains a local repository database of the kind
+.BR pacman (8)
+reads. It wraps
+.BR repo\-add (8)
+and
+.BR repo\-remove (8)
+with a small registry so repositories can be referred to by name.
+.SH COMMANDS
+.TP
+.BI "create " "name directory"
+Register
+.I name
+as a repository rooted at
+.IR directory .
+The directory is recorded now; the database file is generated when the first
+package is added.
+.TP
+.BI "add " "name package.pkg.tar.zst ..."
+Copy one or more package archives (and any adjacent
+.B .sig
+signatures) into the repository and add them to its database.
+.TP
+.BI "remove " "name package-name ..."
+Remove the named packages from the repository database.
+.TP
+.B list
+Print each registered repository and its directory, tab\-separated.
+.TP
+.BI "delete " name
+Unregister
+.IR name .
+The database and package files are deliberately left in place.
+.TP
+.BR help ", " \-\-help ", " \-h
+Show usage.
+.SH NOTES
+Adding a repository to a running system still requires a
+.B [name]
+section in
+.BR pacman.conf (5)
+pointing at the generated database with
+.RB \(dq Server\ =\ file://... \(dq.
+.SH EXIT STATUS
+Returns
+.B 0
+on success and non\-zero on error (unknown command, missing arguments, or a
+failing
+.BR repo\-add (8)
+invocation).
+.SH EXAMPLES
+.nf
+pacmkr\-repo create myrepo ~/.local/share/pacmkr/myrepo
+pacmkr\-repo add myrepo ./hello\-1.0\-1\-x86_64.pkg.tar.zst
+pacmkr\-repo remove myrepo hello
+pacmkr\-repo list
+pacmkr\-repo delete myrepo
+.fi
+.SH SEE ALSO
+.BR pacmkr (1),
+.BR repo\-add (8),
+.BR pacman.conf (5)

@@ -67,6 +67,7 @@ struct Cli {
     // ─── AUR integration (pacmkr extensions) ───────────────────────
     bool aur{false};                      // --aur: build from AUR
     bool aur_deps{false};                 // --aur-deps: auto-resolve deps
+    bool no_review{false};                // --noreview: explicitly skip AUR file review
     std::optional<std::string> search;    // --search QUERY
     unsigned int limit{10};               // --limit N
     std::filesystem::path aur_dir{"aur"}; // --aur-dir DIR
@@ -140,7 +141,7 @@ struct Cli {
     bool nocolor_flag{false};             // --nocolor
 
     // ─── Build flags (passed to makepkg) ───────────────────────────
-    std::vector<std::string> mflags;      // --mflags FLAGS
+    std::vector<std::string> mflags;      // --mflags FLAGS for native builds
 
     // ─── Upgrade filters ───────────────────────────────────────────
     bool nodevel{false};                  // --nodevel (skip dev packages)

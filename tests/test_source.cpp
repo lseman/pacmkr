@@ -48,6 +48,26 @@ int main() {
         pacmkr::source::SourceHandler{base / "cache", true}.download_and_verify(archive_pb, base / "archive-src");
         assert(fs::exists(base / "archive-src/project/value"));
 
+        pacmkr::pkgbuild::Pkgbuild noextract_pb = archive_pb;
+        noextract_pb.noextract = {"project.tar.gz"};
+        pacmkr::source::SourceHandler{base / "cache", true}
+            .download_and_verify(noextract_pb, base / "noextract-src");
+        assert(fs::exists(base / "noextract-src/project.tar.gz"));
+        assert(!fs::exists(base / "noextract-src/project/value"));
+
+        bool rejected_incomplete_integrity = false;
+        try {
+            pacmkr::pkgbuild::Pkgbuild invalid_pb;
+            invalid_pb.pkgname = {"invalid-integrity"};
+            invalid_pb.source = {"input.txt", "code-bin.sh"};
+            invalid_pb.sha256sums = {"SKIP"};
+            pacmkr::source::SourceHandler{base / "invalid-cache"}
+                .download_and_verify(invalid_pb, base / "invalid-src");
+        } catch (...) {
+            rejected_incomplete_integrity = true;
+        }
+        assert(rejected_incomplete_integrity);
+
         fs::create_directories(base / "deb-content");
         std::ofstream(base / "deb-content/data.tar.xz") << "inner archive\n";
         const std::string deb_command = "bsdtar -cf " + (base / "fixture.deb").string() +

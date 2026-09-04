@@ -15,7 +15,7 @@
 
 ## Why pacmkr?
 
-pacmkr brings official repository and AUR workflows into one C++17 command-line
+pacmkr brings official repository and AUR workflows into one C++23 command-line
 tool. Repository reads and system transactions use libalpm directly, and AUR
 packages are resolved and built in dependency order.
 
@@ -23,17 +23,21 @@ packages are resolved and built in dependency order.
 - Atomic native repository refresh and upgrade through libalpm
 - Fuzzy search with Levenshtein distance scoring and typo tolerance
 - Hybrid repo/AUR ranking: unified relevance-sorted results across both sources
+- Full Git diff review of every changed AUR file before it is executed
 - Transitive AUR dependency resolution with topological build ordering
 - PKGBUILD parsing, source verification, packaging, and installation
+- Native PKGBUILD builds with pacmkr-controlled optimization flags
+- Bash-accurate metadata evaluation, architecture arrays, split packages, and VCS `pkgver()`
+- Reproducible `.BUILDINFO`/`.MTREE` archives with package-specific install and changelog files
 - Disk space pre-check before builds (aborts early if insufficient)
-- Build retry with exponential backoff for transient failures
+- Network retry with bounded backoff for transient AUR requests
 - Optional LTO, mold, GCC Graphite, and LLVM Polly build optimization
 - Plain-text command output suitable for terminals, logs, and scripts
 - Optional GTK4 desktop dashboard
 
 ## Quick start
 
-pacmkr currently targets Arch Linux and requires a C++17 compiler, CMake,
+pacmkr currently targets Arch Linux and requires a C++23 compiler, CMake,
 OpenSSL, libalpm, and the standard Arch packaging tools.
 
 ```bash
@@ -68,8 +72,26 @@ make test
 sudo make install
 ```
 
-The install includes the `pacmkr` and `pacmkr-repo` command-line tools, GTK
-application, desktop launcher, application metadata, icon, and license.
+The install includes the `pacmkr` and `pacmkr-repo` command-line tools, their
+`man` pages (`man 1 pacmkr`, `man 1 pacmkr-repo`), bash/zsh/fish shell
+completions, the optional GTK application, desktop launcher, application
+metadata, icon, and license.
+
+### Shell completions
+
+Completions for `pacmkr` and `pacmkr-repo` are installed automatically:
+
+| Shell | Path |
+| ----- | ---- |
+| bash  | `<prefix>/share/bash-completion/completions/` |
+| zsh   | `<prefix>/share/zsh/site-functions/` |
+| fish  | `<prefix>/share/fish/vendor_completions.d/` |
+
+The install directories can be overridden at configure time with
+`-DPACMKR_BASHCOMPLETION_DIR=...`, `-DPACMKR_ZSHCOMPLETION_DIR=...`, and
+`-DPACMKR_FISHCOMPLETION_DIR=...`. For a `--prefix ~/.local` install, make sure
+that prefix is on `$fpath` (zsh) or that
+`~/.local/share/bash-completion/completions` is sourced by your bash setup.
 
 ## Usage
 
@@ -85,6 +107,12 @@ sudo pacmkr -S package-name
 
 # Fetch and build an AUR package with its dependencies
 pacmkr --aur --aur-deps package-name
+
+# Explicitly opt out only in a pre-reviewed, unattended workflow
+pacmkr --aur --noreview package-name
+
+# Build a local PKGBUILD with native CPU and linker optimizations
+pacmkr --build --lto --mold
 
 # Inspect foreign packages and remove a package cleanly
 pacmkr -Qm
@@ -133,14 +161,18 @@ pacmkr --cleanup --cleanup-age 7  # Keep only 7 days
 
 ### Build resilience
 
-**Disk space pre-check**: before invoking makepkg, pacmkr verifies that the
+**Disk space pre-check**: before building, pacmkr verifies that the
 build directory and package destination have at least 2 GB free. Use a custom
 threshold by setting `min_space` in your config file.
 
-**Retry with backoff**: transient build failures (network timeouts, OOM kills,
-GPG keyring issues) are automatically retried up to 2 times with exponential
-backoff (1 s → 3 s → 9 s). Build logs for every attempt are saved under
-`~/.cache/pacmkr/logs/`.
+**Network retry with backoff**: transient AUR request failures are retried with
+bounded exponential backoff. PKGBUILD functions are not retried because build
+scripts are not guaranteed to be safe to execute more than once. Build logs are
+saved under `~/.cache/pacmkr/logs/`.
+
+**Reproducible native archives**: pacmkr honors `SOURCE_DATE_EPOCH`, sorts
+archive entries byte-for-byte, normalizes mtimes, records the build environment
+in `.BUILDINFO`, and generates the standard compressed `.MTREE` index.
 
 **Build time tracking**: each build reports total elapsed time at completion,
 along with the number of retries if any. This helps identify slow builds and
@@ -224,6 +256,8 @@ src/build/       PKGBUILD parsing and package build pipeline
 src/core/        Configuration, package models, shared infrastructure
 src/gui/gtk/     GTK4 desktop UI and backend adapter
 tests/           C++ unit and regression tests
+completions/     bash, zsh, and fish shell completions
+doc/             man pages (pacmkr.1, pacmkr-repo.1)
 ```
 
 ## Development

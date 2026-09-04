@@ -170,6 +170,20 @@ void test_sync_download_parsing() {
     assert(long_form.operation == pacmkr::cli::Cli::Op::Sync && long_form.sync_download);
 }
 
+void test_aur_review_policy_parsing() {
+    auto defaults = parse({"pacmkr", "--aur", "review-test"});
+    assert(defaults.aur);
+    assert(!defaults.no_review);
+
+    auto opted_out = parse({"pacmkr", "--aur", "--noreview", "review-test"});
+    assert(opted_out.no_review);
+}
+
+void test_build_directory_parsing() {
+    auto directory = parse({"pacmkr", "--build", "--dir", "/tmp/build-here"});
+    assert(directory.dir == "/tmp/build-here");
+}
+
 } // namespace
 
 int main() {
@@ -187,6 +201,8 @@ int main() {
     test_query_file_and_changelog_parsing();
     test_sync_clean_parsing();
     test_sync_download_parsing();
+    test_aur_review_policy_parsing();
+    test_build_directory_parsing();
 
     std::cout << "  PASSED: sync_upgrade_detection\n";
     std::cout << "  PASSED: syu_atomic_transaction\n";

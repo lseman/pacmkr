@@ -6,6 +6,9 @@
 #include <sstream>
 #include <optional>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <unistd.h>
 #include "pacmkr/build/pkgbuild.h"
 
 // Inline PKGBUILD parser for testing (mirrors pkgbuild.cpp)
@@ -278,6 +281,81 @@ package_two() { :; }
     assert(parsed.pkgbase() == "one");
 }
 
+void test_file_parser_uses_bash_semantics() {
+    const auto directory = std::filesystem::temp_directory_path() /
+        ("pacmkr-pkgbuild-test-" + std::to_string(getpid()));
+    std::filesystem::create_directories(directory);
+    const auto path = directory / "PKGBUILD";
+    {
+        std::ofstream output(path);
+        output << R"PKGBUILD(
+_base=runtime
+pkgname=("${_base}" "${_base}-docs")
+pkgver="$(printf 2.4)"
+pkgrel=$((1 + 1))
+pkgdesc="${_base} package"
+arch=('x86_64')
+depends=('glibc')
+if [[ $CARCH == x86_64 ]]; then depends+=('zlib>=1'); fi
+source=("archive-${pkgver}.tar.gz")
+source_x86_64=("binary-${CARCH}")
+sha256sums=('SKIP')
+sha256sums_x86_64=('SKIP')
+build() { :; }
+package_runtime() { :; }
+package_runtime-docs() { :; }
+pkgver() { printf '5.7.r3.gabc123'; }
+)PKGBUILD";
+    }
+
+    const auto parsed = pacmkr::pkgbuild::Pkgbuild::parse(path);
+    assert((parsed.pkgname == std::vector<std::string>{"runtime", "runtime-docs"}));
+    assert(parsed.pkgver == "2.4");
+    assert(parsed.pkgrel == "2");
+    assert(parsed.desc == "runtime package");
+    assert((parsed.depends == std::vector<std::string>{"glibc", "zlib>=1"}));
+    assert((parsed.source == std::vector<std::string>{
+        "archive-2.4.tar.gz", "binary-x86_64"}));
+    assert(parsed.has_function("build"));
+    assert(parsed.has_function("package_runtime-docs"));
+    assert(parsed.packages.size() == 2);
+    std::filesystem::create_directories(directory / "src");
+    auto versioned = parsed;
+    versioned.update_version(directory / "src");
+    assert(versioned.pkgver == "5.7.r3.gabc123");
+    assert(versioned.full_version() == "runtime-5.7.r3.gabc123-2");
+    auto epoched = versioned;
+    epoched.epoch = "2";
+    assert(epoched.version() == "2:5.7.r3.gabc123-2");
+    assert(epoched.full_version() == "runtime-2:5.7.r3.gabc123-2");
+
+    const auto metadata_path = directory / "package-metadata";
+    {
+        std::ofstream metadata(metadata_path, std::ios::binary);
+        const auto record = [&](const std::string& type, const std::string& name,
+                                const std::string& value) {
+            metadata.write(type.data(), static_cast<std::streamsize>(type.size()));
+            metadata.put('\0');
+            metadata.write(name.data(), static_cast<std::streamsize>(name.size()));
+            metadata.put('\0');
+            metadata.write(value.data(), static_cast<std::streamsize>(value.size()));
+            metadata.put('\0');
+        };
+        record("S", "pkgdesc", "documentation split");
+        record("S", "install", "runtime-docs.install");
+        record("Z", "depends", "");
+        record("A", "depends", "runtime=5.7.r3.gabc123");
+    }
+    versioned.merge_function_metadata(metadata_path);
+    assert(versioned.desc == "documentation split");
+    assert(versioned.install == "runtime-docs.install");
+    assert((versioned.depends ==
+            std::vector<std::string>{"runtime=5.7.r3.gabc123"}));
+    assert((versioned.pkgname == std::vector<std::string>{"runtime", "runtime-docs"}));
+
+    std::filesystem::remove_all(directory);
+}
+
 int main() {
     std::cout << "Running pkgbuild tests...\n";
     test_parse_simple_pkgbuild();
@@ -285,6 +363,7 @@ int main() {
     test_full_version();
     test_pkgbase_from_pkgname();
     test_real_parser_multiline_and_functions();
+    test_file_parser_uses_bash_semantics();
     std::cout << "All pkgbuild tests passed.\n";
     return 0;
 }
