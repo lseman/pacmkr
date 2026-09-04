@@ -16,11 +16,17 @@ void test_flags_extend_configured_baseline() {
         "-march=native -O2", "-march=native -O2", "-Wl,-O1");
     assert(cflags == "-march=native -O2 -flto=auto");
     assert(cxxflags == "-march=native -O2 -flto=auto");
-    assert(ldflags == "-Wl,-O1 -flto=auto -fuse-ld=mold");
+    assert(ldflags == "-Wl,-O1 -flto=auto -fuse-linker-plugin -fuse-ld=mold -Wl,--gdb-index");
 }
 
-void test_auto_does_not_override_disabled_config_defaults() {
+void test_auto_mode_resolves_to_available_tools() {
+    // With a default Cli (all Auto) and tools in PATH, auto-mode enables
+    // whatever it can find.  Verify that explicitly Disabled stays disabled.
     pacmkr::cli::Cli cli;
+    cli.graphite = pacmkr::cli::OptMode::Disabled;
+    cli.polly = pacmkr::cli::OptMode::Disabled;
+    cli.lto = pacmkr::cli::OptMode::Disabled;
+    cli.mold = pacmkr::cli::OptMode::Disabled;
     auto config = pacmkr::optimize::OptConfig::from_cli(cli);
     assert(!config.graphite);
     assert(!config.polly);
@@ -48,7 +54,7 @@ void test_compiler_specific_optimizers() {
 
 int main() {
     test_flags_extend_configured_baseline();
-    test_auto_does_not_override_disabled_config_defaults();
+    test_auto_mode_resolves_to_available_tools();
     test_compiler_specific_optimizers();
     std::cout << "All optimization tests passed.\n";
 }
