@@ -293,6 +293,7 @@ std::vector<OutOfDatePkg> resolve_out_of_date(
 
     std::map<std::string, std::string> aur_versions;
     std::map<std::string, std::string> aur_descs;
+    std::vector<std::string> checked_names;
     bool had_failure = false;
 
     for (size_t offset = 0; offset < foreign_names.size(); offset += kRpcBatchSize) {
@@ -309,7 +310,10 @@ std::vector<OutOfDatePkg> resolve_out_of_date(
                 continue;
             }
             auto data = nlohmann::json::parse(res->body);
-            if (!data.contains("results")) continue;
+            if (!data.contains("results")) {
+                had_failure = true;
+                continue;
+            }
             aur_cache::merge_results(data["results"]);
             for (auto& item : data["results"]) {
                 const std::string name = item.value("Name", "");
@@ -320,6 +324,12 @@ std::vector<OutOfDatePkg> resolve_out_of_date(
                     aur_descs[name] = item.at("Description").get<std::string>();
                 }
             }
+            // Record this batch's names as checked; a later batch's failure
+            // shouldn't erase the progress already made here. One save at
+            // the end (below) avoids serializing the cache per batch.
+            checked_names.insert(checked_names.end(),
+                                  foreign_names.begin() + static_cast<long>(offset),
+                                  foreign_names.begin() + static_cast<long>(end));
         } catch (...) {
             had_failure = true;
         }
@@ -329,9 +339,8 @@ std::vector<OutOfDatePkg> resolve_out_of_date(
     if (had_failure) {
         std::cerr << "warning: one or more AUR queries failed; "
                      "results for the affected packages fall back to cached metadata\n";
-    } else {
-        aur_cache::note_checked(foreign_names);
     }
+    if (!checked_names.empty()) aur_cache::note_checked(checked_names);
 
     for (const auto& name : foreign_names) {
         const auto& installed_ver = installed_versions.at(name);

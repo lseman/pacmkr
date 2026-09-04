@@ -126,6 +126,25 @@ struct OutOfDatePkg {
 };
 std::vector<OutOfDatePkg> get_upgrades();
 
+/// Result of a root-free repository upgrade check (see below).
+struct PendingUpgradeCheck {
+    bool checked{false};   // false if the check could not be completed
+    std::vector<OutOfDatePkg> upgrades;
+};
+
+/// Determine whether repository packages have pending upgrades without ever
+/// requiring root, so a -Syu invocation with nothing to do never has to ask
+/// for a password (mirrors pacman-contrib's `checkupdates` and yay).
+///
+/// With refresh=false this just reads the already-synced databases (a plain
+/// file read, no privilege needed). With refresh=true, databases are synced
+/// into a private, user-owned directory instead of the real (root-owned)
+/// /var/lib/pacman/sync, seeded from it so only a conditional re-download
+/// happens; the real sync directory is never touched. `checked` is false if
+/// the check could not be completed (network failure, misconfiguration,
+/// etc.) — callers should fall back to requiring root in that case.
+PendingUpgradeCheck check_pending_repo_upgrades(bool refresh);
+
 /// Check if a package is an orphan (installed as dependency but no longer needed).
 bool is_orphan(const std::string& name);
 

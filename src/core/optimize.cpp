@@ -12,10 +12,6 @@ namespace pacmkr::optimize {
 
 namespace {
 
-bool is_enabled(cli::OptMode mode) {
-    return mode == cli::OptMode::Enabled;
-}
-
 bool mold_available() {
     return find_tool("mold").has_value();
 }

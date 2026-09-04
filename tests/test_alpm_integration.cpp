@@ -133,4 +133,79 @@ int main() {
     }
     fs::remove_all(base);
     std::cout << "isolated native libalpm transaction passed\n";
+
+    // check_pending_repo_upgrades: the root-free upgrade check (used to
+    // decide whether -Syu needs to ask for a password at all) against a
+    // real, if synthetic, file:// repository.
+    {
+        const auto check_id = std::to_string(getpid()) + "-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        const fs::path check_base = fs::temp_directory_path() / ("pacmkr-checkdb-test-" + check_id);
+        const fs::path check_root = check_base / "root";
+        const fs::path check_db = check_base / "db";
+        const fs::path check_cache = check_base / "cache";
+        const fs::path check_repo_dir = check_base / "repo";
+        const fs::path check_config = check_base / "pacman.conf";
+        fs::create_directories(check_root);
+        fs::create_directories(check_db);
+        fs::create_directories(check_cache);
+        fs::create_directories(check_repo_dir);
+
+        const std::string repo_name = "checkrepo";
+        std::ofstream(check_config)
+            << "[options]\n"
+            << "RootDir = " << check_root.string() << "\n"
+            << "DBPath = " << check_db.string() << "\n"
+            << "CacheDir = " << check_cache.string() << "\n"
+            << "LogFile = " << (check_base / "pacman.log").string() << "\n"
+            << "GPGDir = " << (check_base / "gnupg").string() << "\n"
+            << "SigLevel = Never\nLocalFileSigLevel = Never\n"
+            << "[" << repo_name << "]\n"
+            << "Server = file://" << check_repo_dir.string() << "\n";
+
+        // The installed version (1.0-1) and the newer version sitting in
+        // the repo (2.0-1).
+        const fs::path old_pkg = make_archive(check_base, check_base / "check-old", "checkpkg", "1.0-1");
+        const fs::path new_pkg = make_archive(check_base, check_base / "check-new", "checkpkg", "2.0-1");
+        fs::copy_file(new_pkg, check_repo_dir / new_pkg.filename());
+
+        const std::string repo_add_cmd = "repo-add '" +
+            (check_repo_dir / (repo_name + ".db.tar.gz")).string() + "' '" +
+            (check_repo_dir / new_pkg.filename()).string() + "' >/dev/null 2>&1";
+        assert(std::system(repo_add_cmd.c_str()) == 0);
+
+        try {
+            pacmkr::alpm::init(check_root.string(), check_db.string(), check_config.string());
+            assert(pacmkr::alpm::install_files({old_pkg.string()}, true) == 0);
+
+            // No sync has happened yet, so there is nothing cached to
+            // compare against — the check still completes cleanly.
+            auto before_sync = pacmkr::alpm::check_pending_repo_upgrades(false);
+            assert(before_sync.checked);
+            assert(before_sync.upgrades.empty());
+
+            // refresh=true pulls the repo db into a private scratch dir and
+            // finds the real pending upgrade.
+            auto refreshed = pacmkr::alpm::check_pending_repo_upgrades(true);
+            assert(refreshed.checked);
+            assert(refreshed.upgrades.size() == 1);
+            assert(refreshed.upgrades[0].name == "checkpkg");
+            assert(refreshed.upgrades[0].installed_version == "1.0-1");
+            assert(refreshed.upgrades[0].repo_version == "2.0-1");
+
+            // As a non-root caller, the check must never write into the
+            // real (test-fixture) dbpath — only its own private scratch dir.
+            if (geteuid() != 0) {
+                assert(!fs::exists(check_db / "sync" / (repo_name + ".db")));
+            }
+
+            pacmkr::alpm::shutdown();
+        } catch (...) {
+            pacmkr::alpm::shutdown();
+            fs::remove_all(check_base);
+            throw;
+        }
+        fs::remove_all(check_base);
+        std::cout << "root-free upgrade check passed\n";
+    }
 }
